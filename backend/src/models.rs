@@ -86,3 +86,60 @@ pub struct WebSocketMessage {
     pub message_type: String,
     pub data: serde_json::Value,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComplianceReport {
+    pub vault_id: String,
+    pub owner: String,
+    pub beneficiary: String,
+    pub report_generated_at: DateTime<Utc>,
+    pub fund_movements: Vec<FundMovement>,
+    pub beneficiary_changes: Vec<BeneficiaryChange>,
+    pub ttl_history: Vec<TtlEvent>,
+    pub total_deposits: i128,
+    pub total_withdrawals: i128,
+    pub current_balance: i128,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FundMovement {
+    pub timestamp: DateTime<Utc>,
+    pub movement_type: String,
+    pub amount: i128,
+    pub balance_after: i128,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BeneficiaryChange {
+    pub timestamp: DateTime<Utc>,
+    pub old_beneficiary: String,
+    pub new_beneficiary: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TtlEvent {
+    pub timestamp: DateTime<Utc>,
+    pub event_type: String,
+    pub ttl_remaining: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct VaultTemplate {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub check_in_interval: u64,
+    pub recommended_for: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VaultTemplateList {
+    pub templates: Vec<VaultTemplate>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateVaultFromTemplate {
+    pub template_id: String,
+    pub owner: String,
+    pub beneficiary: String,
+}
