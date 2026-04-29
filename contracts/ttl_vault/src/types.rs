@@ -36,6 +36,7 @@ pub const DISPUTE_RESOLVED_TOPIC: Symbol = symbol_short!("disp_res");
 pub const WITHDRAWAL_SCHEDULED_TOPIC: Symbol = symbol_short!("wd_sch");
 pub const WITHDRAWAL_EXECUTED_TOPIC: Symbol = symbol_short!("wd_exec");
 pub const CONDITIONS_ACCEPTED_TOPIC: Symbol = symbol_short!("cond_acc");
+pub const SET_SPENDING_LIMIT_TOPIC: Symbol = symbol_short!("set_slmt");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -82,7 +83,7 @@ pub enum DataKey {
     WithdrawalSchedule(u64),
     DisputeStatus(u64),
     ConditionalAcceptance(u64),
-    PendingOwnership(u64),
+    ArchivedVault(u64),
 }
 
 /// A vesting schedule attached to a vault.
@@ -214,6 +215,8 @@ pub struct Vault {
     pub max_deposit_amount: Option<i128>,
     /// Withdrawal approval threshold - Issue #404
     pub withdrawal_approval_threshold: Option<i128>,
+    /// Maximum amount releasable per trigger_release call - Issue #382
+    pub spending_limit: Option<i128>,
 }
 
 /// Passkey usage entry for tracking check-ins - Issue #395
@@ -258,15 +261,7 @@ pub struct ConditionalAcceptanceEntry {
     pub approved_by_owner: bool,
 }
 
-/// Pending ownership transfer request with time-lock.
-/// The new owner must call `accept_ownership_transfer` after `unlocks_at` to complete the transfer.
+/// Archived vault info for restoration - Issue #443
 #[contracttype]
 #[derive(Clone)]
-pub struct OwnershipTransferRequest {
-    /// The proposed new owner address.
-    pub new_owner: Address,
-    /// Unix timestamp when the new owner is allowed to accept (time-lock expiry).
-    pub unlocks_at: u64,
-    /// Unix timestamp after which the request expires and must be re-initiated.
-    pub expires_at: u64,
-}
+pub struct ArchivedVaultInfo(pub Vault);
