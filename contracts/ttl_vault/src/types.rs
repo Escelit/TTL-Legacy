@@ -58,19 +58,10 @@ pub const MULTISIG_REJECTED_TOPIC: Symbol = symbol_short!("ms_rej");
 pub const MULTISIG_EXECUTED_TOPIC: Symbol = symbol_short!("ms_exec");
 pub const MULTISIG_PROPOSAL_EXPIRY: u64 = 604_800; // 7 days
 
-// Issue #476 - Vault Metadata Encryption
-pub const METADATA_ENCRYPTED_TOPIC: Symbol = symbol_short!("meta_enc");
-pub const METADATA_DECRYPTED_TOPIC: Symbol = symbol_short!("meta_dec");
-
-// Issue #477 - Vault Deduplication
-pub const VAULT_DUPLICATE_TOPIC: Symbol = symbol_short!("v_dup");
-
-// Issue #478 - Adaptive Check-In Intervals
-pub const ADAPTIVE_INTERVAL_TOPIC: Symbol = symbol_short!("adp_intv");
-
-// Issue #479 - Check-In Streak Tracking
-pub const STREAK_UPDATED_TOPIC: Symbol = symbol_short!("streak");
-pub const STREAK_BROKEN_TOPIC: Symbol = symbol_short!("stk_brk");
+pub const META_VERSION_TOPIC: Symbol = symbol_short!("meta_ver");
+pub const META_REVERT_TOPIC: Symbol = symbol_short!("meta_rev");
+pub const VAULT_ARCHIVED_TOPIC: Symbol = symbol_short!("v_arch");
+pub const VAULT_CAP_TOPIC: Symbol = symbol_short!("v_cap");
 
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
@@ -130,14 +121,8 @@ pub enum DataKey {
     MultiSigConfig(u64),
     MultiSigProposal(u64, u64),
     MultiSigProposalCount(u64),
-    // Issue #476 - Vault Metadata Encryption
-    EncryptedMetadata(u64),
-    // Issue #477 - Vault Deduplication
-    VaultFingerprint(BytesN<32>),
-    // Issue #478 - Adaptive Check-In Intervals
-    CheckInHistory(u64),
-    // Issue #479 - Check-In Streak Tracking
-    CheckInStreak(u64),
+    MetadataHistory(u64),
+    OwnerVaultCount(Address),
 }
 
 /// A vesting schedule attached to a vault.
@@ -331,6 +316,16 @@ pub struct ActivityLogEntry {
 #[derive(Clone)]
 pub struct ArchivedVaultInfo(pub Vault);
 
+/// A single metadata version snapshot - Issue #468
+#[contracttype]
+#[derive(Clone)]
+pub struct MetadataVersionEntry {
+    pub version: u32,
+    pub metadata: String,
+    pub updated_at: u64,
+    pub updated_by: Address,
+}
+
 /// Ownership transfer request
 #[contracttype]
 #[derive(Clone)]
@@ -398,28 +393,43 @@ pub enum ProposalStatus {
     Expired,
 }
 
-/// Encrypted metadata entry - Issue #476
+/// State transition record for vault status changes - Issue #472
 #[contracttype]
 #[derive(Clone)]
-pub struct EncryptedMetadata {
-    /// Encrypted metadata bytes (ciphertext)
-    pub ciphertext: Bytes,
-    /// Nonce/IV used for encryption (stored so decryption is possible)
-    pub nonce: BytesN<32>,
-    /// Whether this metadata is currently encrypted
-    pub is_encrypted: bool,
+pub struct StateTransitionEntry {
+    pub from_status: ReleaseStatus,
+    pub to_status: ReleaseStatus,
+    pub actor: Address,
+    pub timestamp: u64,
 }
 
-/// Check-in streak tracking entry - Issue #479
+/// Ownership proof result - Issue #473
 #[contracttype]
 #[derive(Clone)]
-pub struct CheckInStreak {
-    /// Current consecutive check-in count
-    pub current_streak: u32,
-    /// Longest streak ever achieved
-    pub longest_streak: u32,
-    /// Timestamp of the last check-in
+pub struct OwnershipProof {
+    pub vault_id: u64,
+    pub owner_hash: BytesN<32>,
+    pub timestamp: u64,
+    pub is_active: bool,
+}
+
+/// Vault integrity report - Issue #474
+#[contracttype]
+#[derive(Clone)]
+pub struct IntegrityReport {
+    pub vault_id: u64,
+    pub checksum: BytesN<32>,
+    pub is_valid: bool,
+    pub timestamp: u64,
+}
+
+/// Vault status summary for batch queries - Issue #475
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultStatusSummary {
+    pub vault_id: u64,
+    pub status: ReleaseStatus,
+    pub balance: i128,
     pub last_check_in: u64,
-    /// Total check-ins recorded
-    pub total_check_ins: u32,
+    pub is_expired: bool,
 }

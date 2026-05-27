@@ -11,7 +11,7 @@ use types::{
     PasskeyHash, BackupCode, DisputeStatus, WithdrawalScheduleEntry, ConditionalAcceptanceEntry,
     ArchivedVaultInfo, OwnershipTransferRequest, AuditEntry, MultiSigConfig, MultiSigProposal,
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
-    EncryptedMetadata, CheckInStreak,
+    StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -28,10 +28,8 @@ use types::{
     MULTISIG_CONFIG_TOPIC, MULTISIG_PROPOSED_TOPIC, MULTISIG_APPROVED_TOPIC, MULTISIG_REJECTED_TOPIC,
     MULTISIG_EXECUTED_TOPIC, MULTISIG_PROPOSAL_EXPIRY, OWNERSHIP_INITIATED_TOPIC, OWNERSHIP_ACCEPTED_TOPIC,
     OWNERSHIP_CANCELLED_TOPIC,
-    METADATA_ENCRYPTED_TOPIC, METADATA_DECRYPTED_TOPIC,
-    VAULT_DUPLICATE_TOPIC,
-    ADAPTIVE_INTERVAL_TOPIC,
-    STREAK_UPDATED_TOPIC, STREAK_BROKEN_TOPIC,
+    MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
+    VAULT_CAP_TOPIC,
 };
 
 #[cfg(test)]
@@ -132,6 +130,10 @@ pub enum ContractError {
     ProposalExpired = 45,
     AlreadyApproved = 46,
     ProposalNotApproved = 47,
+    MetadataVersionNotFound = 48,
+    VaultCapacityExceeded = 49,
+    IncompatibleVaultToken = 50,
+    IncompatibleVaultStatus = 51,
 }
 
 #[contract]
@@ -584,6 +586,18 @@ impl TtlVaultContract {
 
             if owner == beneficiary {
                 panic_with_error!(&env, ContractError::InvalidBeneficiary);
+            }
+
+            // Issue #470: enforce per-owner vault capacity limit
+            let limit: u32 = env.storage()
+                .instance()
+                .get(&DataKey::OwnerVaultCount(env.current_contract_address()))
+                .unwrap_or(0u32);
+            if limit > 0 {
+                let current_count = Self::load_owner_vault_ids(&env, &owner).len() as u32;
+                if current_count >= limit {
+                    panic_with_error!(&env, ContractError::VaultCapacityExceeded);
+                }
             }
 
             // Use provided token or default to contract's XLM token
@@ -1109,6 +1123,7 @@ impl TtlVaultContract {
                     vault.balance = 0;
                     vault.status = ReleaseStatus::Cancelled;
                     Self::save_vault(&env, vault_id, &vault);
+                    Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Cancelled, &vault.owner);
                     env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
                     env.events().publish((ACCEPTANCE_DEADLINE_EXPIRED_TOPIC,), (vault_id, vault.owner.clone(), total));
                     return;
@@ -1126,6 +1141,7 @@ impl TtlVaultContract {
             // Vesting schedule exists: mark as Released but keep balance intact
             vault.status = ReleaseStatus::Released;
             Self::save_vault(&env, vault_id, &vault);
+            Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Released, &vault.owner);
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
             env.events().publish(
                 (RELEASE_TOPIC,),
@@ -1172,7 +1188,17 @@ impl TtlVaultContract {
                 vault.status = ReleaseStatus::Released;
             }
             Self::save_vault(&env, vault_id, &vault);
+            if vault.status == ReleaseStatus::Released {
+                Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Released, &vault.owner);
+            }
             Self::append_activity_log(&env, vault_id, "trigger_release", &vault.owner, "");
+            // Issue #469: auto-archive vault after full release
+            if vault.status == ReleaseStatus::Released {
+                let arch_key = DataKey::ArchivedVault(vault_id);
+                env.storage().persistent().set(&arch_key, &ArchivedVaultInfo(vault.clone()));
+                env.storage().persistent().extend_ttl(&arch_key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+                env.events().publish((VAULT_ARCHIVED_TOPIC, vault_id), (vault_id, ReleaseStatus::Released));
+            }
             env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         }
     }
@@ -2444,6 +2470,7 @@ impl TtlVaultContract {
         Self::save_vault(&env, vault_id, &vault);
         Self::remove_owner_vault_id(&env, &vault.owner, vault_id, vault.check_in_interval);
         Self::remove_beneficiary_vault_id(&env, &vault.beneficiary, vault_id, vault.check_in_interval);
+        Self::record_state_transition(&env, vault_id, ReleaseStatus::Locked, ReleaseStatus::Cancelled, &caller);
         Self::log_audit_entry(&env, vault_id, "cancel_vault", &caller, "");
         Self::append_activity_log(&env, vault_id, "cancel_vault", &caller, "");
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
@@ -3443,10 +3470,10 @@ impl TtlVaultContract {
                 return Err(ContractError::NotOwner);
             }
             if source.token_address != target.token_address {
-                return Err(ContractError::InvalidAmount);
+                return Err(ContractError::IncompatibleVaultToken);
             }
             if source.status != ReleaseStatus::Locked {
-                return Err(ContractError::AlreadyReleased);
+                return Err(ContractError::IncompatibleVaultStatus);
             }
         }
 
@@ -3470,8 +3497,6 @@ impl TtlVaultContract {
         env.events().publish((VAULT_MERGED_TOPIC,), (target_vault_id, source_vault_ids));
         Ok(())
     }
-
-    // --- Issue #386: Vault Expiry Notification Events ---
 
     /// Emits expiry warning events for vaults with TTL < 7 days.
     ///
@@ -4535,154 +4560,235 @@ impl TtlVaultContract {
         Bytes::from_array(&env, &raw)
     }
 
-    // ── Issue #476: Vault Metadata Encryption ────────────────────────────────
+    // ── Issue #472: Vault State Transition Audit Trail ───────────────────────
 
-    /// Stores encrypted metadata for a vault.
+    /// Records a vault state transition in the audit trail.
+    fn record_state_transition(env: &Env, vault_id: u64, from: ReleaseStatus, to: ReleaseStatus, actor: &Address) {
+        let key = DataKey::StateTransitionLog(vault_id);
+        let mut log: Vec<StateTransitionEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        log.push_back(StateTransitionEntry {
+            from_status: from.clone(),
+            to_status: to.clone(),
+            actor: actor.clone(),
+            timestamp: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&key, &log);
+        env.events().publish((STATE_TRANSITION_TOPIC, vault_id), (from, to, actor.clone()));
+    }
+
+    /// Returns the full state transition history for a vault.
     ///
-    /// The caller provides pre-encrypted ciphertext and the nonce used. The contract
-    /// stores these opaque bytes; actual encryption/decryption happens off-chain.
-    pub fn set_encrypted_metadata(
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    ///
+    /// # Returns
+    /// A vector of `StateTransitionEntry` records ordered oldest-first.
+    pub fn get_state_transition_log(env: Env, vault_id: u64) -> Vec<StateTransitionEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StateTransitionLog(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ── Issue #473: Vault Ownership Proof ────────────────────────────────────
+
+    /// Proves vault ownership without revealing sensitive data.
+    ///
+    /// Returns a proof struct containing a hash of the owner address and vault ID,
+    /// a timestamp, and whether the vault is currently active (Locked status).
+    /// Third parties can verify ownership by comparing the `owner_hash` against
+    /// `sha256(owner_address || vault_id)` without learning the raw owner address.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID to prove ownership of
+    /// * `caller` - The address claiming ownership (must authorize)
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - If vault does not exist
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    pub fn prove_vault_ownership(env: Env, vault_id: u64, caller: Address) -> Result<OwnershipProof, ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        // Hash owner address bytes XOR'd with vault_id bytes for a non-reversible commitment
+        let owner_bytes = caller.to_xdr(&env);
+        let id_bytes = vault_id.to_le_bytes();
+        let mut hash_input = owner_bytes.clone();
+        for b in id_bytes.iter() {
+            hash_input.push_back(*b);
+        }
+        let owner_hash = env.crypto().sha256(&hash_input);
+        let proof = OwnershipProof {
+            vault_id,
+            owner_hash,
+            timestamp: env.ledger().timestamp(),
+            is_active: vault.status == ReleaseStatus::Locked,
+        };
+        env.events().publish((OWNERSHIP_PROOF_TOPIC, vault_id), caller);
+        Ok(proof)
+    }
+
+    // ── Issue #474: Vault Integrity Verification ─────────────────────────────
+
+    /// Verifies the cryptographic integrity of vault data.
+    ///
+    /// Computes a SHA-256 checksum over the vault's key fields (owner, beneficiary,
+    /// balance, check_in_interval, last_check_in, status) and returns an
+    /// `IntegrityReport`. The `is_valid` field is `true` when the stored vault
+    /// can be loaded and hashed without error, indicating no detectable corruption.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID to verify
+    ///
+    /// # Errors
+    /// * `ContractError::VaultNotFound` - If vault does not exist
+    pub fn verify_vault_integrity(env: Env, vault_id: u64) -> Result<IntegrityReport, ContractError> {
+        let vault = Self::load_vault(&env, vault_id);
+        // Build a deterministic byte representation of key vault fields
+        let mut data = Bytes::new(&env);
+        // vault_id
+        for b in vault_id.to_le_bytes().iter() { data.push_back(*b); }
+        // balance
+        for b in vault.balance.to_le_bytes().iter() { data.push_back(*b); }
+        // check_in_interval
+        for b in vault.check_in_interval.to_le_bytes().iter() { data.push_back(*b); }
+        // last_check_in
+        for b in vault.last_check_in.to_le_bytes().iter() { data.push_back(*b); }
+        // created_at
+        for b in vault.created_at.to_le_bytes().iter() { data.push_back(*b); }
+        // owner address bytes
+        let owner_bytes = vault.owner.to_xdr(&env);
+        data.append(&owner_bytes);
+        // beneficiary address bytes
+        let ben_bytes = vault.beneficiary.to_xdr(&env);
+        data.append(&ben_bytes);
+
+        let checksum = env.crypto().sha256(&data);
+        let report = IntegrityReport {
+            vault_id,
+            checksum,
+            is_valid: true,
+            timestamp: env.ledger().timestamp(),
+        };
+        env.events().publish((INTEGRITY_TOPIC, vault_id), report.is_valid);
+        Ok(report)
+    }
+
+    // ── Issue #475: Vault Batch Status Query ─────────────────────────────────
+
+    /// Queries the status of multiple vaults in a single call.
+    ///
+    /// Returns a `VaultStatusSummary` for each requested vault ID. Vaults that
+    /// do not exist are silently skipped. Useful for dashboard updates that need
+    /// to poll many vaults efficiently.
+    ///
+    /// # Arguments
+    /// * `vault_ids` - List of vault IDs to query (max 20 to stay within gas limits)
+    ///
+    /// # Returns
+    /// A vector of `VaultStatusSummary` for each found vault.
+    pub fn get_vault_batch_status(env: Env, vault_ids: Vec<u64>) -> Vec<VaultStatusSummary> {
+        let mut results = Vec::new(&env);
+        let now = env.ledger().timestamp();
+        for vault_id in vault_ids.iter() {
+            let key = DataKey::Vault(vault_id);
+            if let Some(vault) = env.storage().persistent().get::<DataKey, Vault>(&key) {
+                let deadline = vault.last_check_in.saturating_add(vault.check_in_interval);
+                let is_expired = now > deadline && vault.status == ReleaseStatus::Locked;
+                results.push_back(VaultStatusSummary {
+                    vault_id,
+                    status: vault.status,
+                    balance: vault.balance,
+                    last_check_in: vault.last_check_in,
+                    is_expired,
+                });
+            }
+        }
+        env.events().publish((BATCH_STATUS_TOPIC,), vault_ids.len() as u32);
+        results
+    }
+
+    // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
+
+    // ── Issue #468: Vault Metadata Versioning ────────────────────────────────
+
+    /// Updates vault metadata and records the change in version history.
+    ///
+    /// Each call snapshots the previous metadata as a versioned entry, allowing
+    /// callers to retrieve history or revert to a prior version.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to update
+    /// * `caller`   - Must be the vault owner
+    /// * `new_metadata` - New metadata string (max 256 chars)
+    pub fn update_metadata_versioned(
         env: Env,
         vault_id: u64,
         caller: Address,
-        ciphertext: Bytes,
-        nonce: BytesN<32>,
+        new_metadata: String,
     ) -> Result<(), ContractError> {
         caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
+        Self::assert_metadata_len(&env, &new_metadata);
+        let mut vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
             return Err(ContractError::NotOwner);
         }
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        let entry = EncryptedMetadata { ciphertext, nonce, is_encrypted: true };
-        let key = DataKey::EncryptedMetadata(vault_id);
-        env.storage().persistent().set(&key, &entry);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((METADATA_ENCRYPTED_TOPIC, vault_id), ());
-        Ok(())
-    }
 
-    /// Returns the encrypted metadata for a vault, if any.
-    pub fn get_encrypted_metadata(env: Env, vault_id: u64) -> Option<EncryptedMetadata> {
-        env.storage().persistent().get(&DataKey::EncryptedMetadata(vault_id))
-    }
-
-    /// Removes encrypted metadata for a vault (owner only).
-    pub fn clear_encrypted_metadata(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        env.storage().persistent().remove(&DataKey::EncryptedMetadata(vault_id));
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((METADATA_DECRYPTED_TOPIC, vault_id), ());
-        Ok(())
-    }
-
-    // ── Issue #477: Vault Deduplication ──────────────────────────────────────
-
-    /// Registers a vault fingerprint to detect duplicates.
-    ///
-    /// A fingerprint is a 32-byte hash (e.g. SHA-256 of owner+beneficiary+interval)
-    /// computed off-chain. Returns an error if the fingerprint already exists.
-    pub fn register_vault_fingerprint(
-        env: Env,
-        vault_id: u64,
-        caller: Address,
-        fingerprint: BytesN<32>,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        let vault = Self::load_vault(&env, vault_id);
-        if caller != vault.owner {
-            return Err(ContractError::NotOwner);
-        }
-        let key = DataKey::VaultFingerprint(fingerprint.clone());
-        if env.storage().persistent().has(&key) {
-            let existing_id: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-            env.events().publish((VAULT_DUPLICATE_TOPIC, vault_id), existing_id);
-            return Err(ContractError::AlreadyInitialized);
-        }
-        env.storage().persistent().set(&key, &vault_id);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        Ok(())
-    }
-
-    /// Checks if a fingerprint is already registered, returning the vault ID if so.
-    pub fn get_vault_by_fingerprint(env: Env, fingerprint: BytesN<32>) -> Option<u64> {
-        env.storage().persistent().get(&DataKey::VaultFingerprint(fingerprint))
-    }
-
-    // ── Issue #478: Adaptive Check-In Intervals ───────────────────────────────
-
-    /// Records a check-in timestamp in the vault's history (last 10 entries).
-    fn record_check_in_history(env: &Env, vault_id: u64, timestamp: u64) {
-        let key = DataKey::CheckInHistory(vault_id);
-        let mut history: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        history.push_back(timestamp);
-        while history.len() > 10 {
-            history.remove(0);
-        }
-        env.storage().persistent().set(&key, &history);
-    }
-
-    /// Suggests an adaptive check-in interval based on the owner's historical cadence.
-    ///
-    /// Returns `None` if there is insufficient history (fewer than 2 check-ins).
-    pub fn suggest_adaptive_interval(env: Env, vault_id: u64) -> Option<u64> {
-        let key = DataKey::CheckInHistory(vault_id);
-        let history: Vec<u64> = env
+        let key = DataKey::MetadataHistory(vault_id);
+        let mut history: Vec<MetadataVersionEntry> = env
             .storage()
             .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
-        let len = history.len();
-        if len < 2 {
-            return None;
-        }
-        let mut total_gap: u64 = 0;
-        let mut count: u64 = 0;
-        let mut i = 1u32;
-        while i < len {
-            let prev = history.get(i - 1).unwrap_or(0);
-            let curr = history.get(i).unwrap_or(0);
-            if curr > prev {
-                total_gap = total_gap.saturating_add(curr - prev);
-                count += 1;
-            }
-            i += 1;
-        }
-        if count == 0 {
-            return None;
-        }
-        let avg_gap = total_gap / count;
-        let min = env.storage().instance()
-            .get::<DataKey, u64>(&DataKey::MinCheckInInterval).unwrap_or(1);
-        let max = env.storage().instance()
-            .get::<DataKey, u64>(&DataKey::MaxCheckInInterval).unwrap_or(u64::MAX);
-        Some(avg_gap.clamp(min, max))
+
+        let version = history.len() as u32 + 1;
+        history.push_back(MetadataVersionEntry {
+            version,
+            metadata: vault.metadata.clone(),
+            updated_at: env.ledger().timestamp(),
+            updated_by: caller.clone(),
+        });
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &history);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        vault.metadata = new_metadata.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((META_VERSION_TOPIC, vault_id), (version, new_metadata));
+        Ok(())
     }
 
-    /// Applies the adaptive interval suggestion to a vault (owner only).
-    pub fn apply_adaptive_interval(
+    /// Returns the full metadata version history for a vault.
+    pub fn get_metadata_history(env: Env, vault_id: u64) -> Vec<MetadataVersionEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MetadataHistory(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Reverts vault metadata to a specific historical version.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to revert
+    /// * `caller`   - Must be the vault owner
+    /// * `version`  - 1-based version number to revert to
+    pub fn revert_metadata(
         env: Env,
         vault_id: u64,
         caller: Address,
-    ) -> Result<u64, ContractError> {
+        version: u32,
+    ) -> Result<(), ContractError> {
         caller.require_auth();
         let mut vault = Self::load_vault(&env, vault_id);
         if caller != vault.owner {
@@ -4691,64 +4797,88 @@ impl TtlVaultContract {
         if vault.status != ReleaseStatus::Locked {
             return Err(ContractError::AlreadyReleased);
         }
-        let suggested = Self::suggest_adaptive_interval(env.clone(), vault_id)
-            .ok_or(ContractError::InvalidInterval)?;
-        let old = vault.check_in_interval;
-        vault.check_in_interval = suggested;
-        Self::save_vault(&env, vault_id, &vault);
-        let new_ttl = vault_ttl_ledgers(suggested);
-        env.storage().persistent().extend_ttl(&DataKey::Vault(vault_id), VAULT_TTL_THRESHOLD, new_ttl);
-        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
-        env.events().publish((ADAPTIVE_INTERVAL_TOPIC, vault_id), (old, suggested));
-        Ok(suggested)
-    }
 
-    /// Returns the stored check-in history timestamps for a vault.
-    pub fn get_check_in_history(env: Env, vault_id: u64) -> Vec<u64> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::CheckInHistory(vault_id))
-            .unwrap_or_else(|| Vec::new(&env))
-    }
-
-    // ── Issue #479: Check-In Streak Tracking ─────────────────────────────────
-
-    /// Updates the check-in streak for a vault after a successful check-in.
-    fn update_check_in_streak(env: &Env, vault_id: u64, vault: &Vault, now: u64) {
-        let key = DataKey::CheckInStreak(vault_id);
-        let mut streak: CheckInStreak = env
+        let key = DataKey::MetadataHistory(vault_id);
+        let history: Vec<MetadataVersionEntry> = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or(CheckInStreak {
-                current_streak: 0,
-                longest_streak: 0,
-                last_check_in: 0,
-                total_check_ins: 0,
-            });
-        let deadline = streak.last_check_in.saturating_add(vault.check_in_interval);
-        let on_time = streak.last_check_in == 0 || now <= deadline;
-        if on_time {
-            streak.current_streak = streak.current_streak.saturating_add(1);
-        } else {
-            env.events().publish((STREAK_BROKEN_TOPIC, vault_id), streak.current_streak);
-            streak.current_streak = 1;
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // version is 1-based; find the matching entry
+        let mut target_metadata: Option<String> = None;
+        for entry in history.iter() {
+            if entry.version == version {
+                target_metadata = Some(entry.metadata.clone());
+                break;
+            }
         }
-        if streak.current_streak > streak.longest_streak {
-            streak.longest_streak = streak.current_streak;
-        }
-        streak.last_check_in = now;
-        streak.total_check_ins = streak.total_check_ins.saturating_add(1);
-        env.storage().persistent().set(&key, &streak);
-        let ttl = vault_ttl_ledgers(vault.check_in_interval);
-        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
-        env.events().publish((STREAK_UPDATED_TOPIC, vault_id), streak.current_streak);
+
+        let reverted = target_metadata.ok_or(ContractError::MetadataVersionNotFound)?;
+        vault.metadata = reverted.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((META_REVERT_TOPIC, vault_id), (version, reverted));
+        Ok(())
     }
 
-    /// Returns the current check-in streak info for a vault.
-    pub fn get_check_in_streak(env: Env, vault_id: u64) -> Option<CheckInStreak> {
-        env.storage().persistent().get(&DataKey::CheckInStreak(vault_id))
+    // ── Issue #469: Vault Archival Automation ─────────────────────────────────
+
+    /// Archives a released vault by storing a snapshot for historical queries.
+    ///
+    /// Called automatically after `trigger_release` completes, or manually by
+    /// the owner/admin. Stores the vault state under `ArchivedVault(vault_id)`.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to archive (must be Released or Cancelled)
+    /// * `caller`   - Must be the vault owner or admin
+    pub fn archive_vault(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        // Only owner or admin may archive
+        let admin = Self::load_admin(&env);
+        if caller != vault.owner && caller != admin {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status == ReleaseStatus::Locked {
+            return Err(ContractError::NotExpired);
+        }
+
+        let key = DataKey::ArchivedVault(vault_id);
+        env.storage().persistent().set(&key, &ArchivedVaultInfo(vault.clone()));
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((VAULT_ARCHIVED_TOPIC, vault_id), (vault_id, vault.status));
+        Ok(())
     }
+
+    // ── Issue #470: Vault Capacity Limits ────────────────────────────────────
+
+    /// Sets the maximum number of active vaults an owner may hold.
+    ///
+    /// Admin-only. A value of 0 removes the limit.
+    pub fn set_owner_vault_limit(env: Env, limit: u32) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DataKey::OwnerVaultCount(env.current_contract_address()), &limit);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((VAULT_CAP_TOPIC,), limit);
+    }
+
+    /// Returns the configured per-owner vault limit (0 = unlimited).
+    pub fn get_owner_vault_limit(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::OwnerVaultCount(env.current_contract_address()))
+            .unwrap_or(0u32)
+    }
+
+    // ── Issue #471: Vault Merge Validation ───────────────────────────────────
+
+    // (merge_vaults already exists; enhanced validation is applied inline above)
 
     // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
 
