@@ -13,6 +13,7 @@ use types::{
     MultiSigOperation, ProposalStatus, PasskeyUsageEntry, BeneficiaryStatus, BridgeConfig,
     StateTransitionEntry, OwnershipProof, IntegrityReport, VaultStatusSummary,
     TtlBorrowRecord,
+    GeoCheckInEntry,
     EXPIRY_WARNING_THRESHOLD, BENEFICIARY_UPDATED_TOPIC, CANCEL_TOPIC, CHECK_IN_TOPIC,
     CLAIM_VEST_TOPIC, DEPOSIT_TOPIC, OWNERSHIP_TOPIC, PAUSE_TOPIC, PING_EXPIRY_TOPIC,
     RELEASE_TOPIC, SET_BENEFICIARIES_TOPIC, SET_MAX_INTERVAL_TOPIC, SET_MIN_INTERVAL_TOPIC,
@@ -35,6 +36,7 @@ use types::{
     TTL_BORROW_TOPIC, TTL_REPAY_TOPIC,
     CHECKIN_RATE_LIMITED_TOPIC,
     TTL_ACCELERATE_TOPIC,
+    CHECKIN_GEO_TOPIC,
 };
 
 #[cfg(test)]
@@ -3308,6 +3310,70 @@ impl TtlVaultContract {
             (accelerate_by_seconds, remaining - accelerate_by_seconds),
         );
         Ok(())
+    }
+
+    // ── Issue: Geographic Check-in Tracking ───────────────────────────────────
+
+    /// Records a check-in with geographic location metadata for security and anomaly detection.
+    ///
+    /// Delegates to the standard `check_in` for all vault validations (owner auth,
+    /// rate limiting, passkey expiry, TTL cap). On success, appends a `GeoCheckInEntry`
+    /// to the vault's persistent geo log and emits a `ci_geo` event.
+    ///
+    /// # Arguments
+    /// * `vault_id`        - The vault to check in
+    /// * `caller`          - Must be the vault owner
+    /// * `passkey_hash`    - Passkey used for this check-in
+    /// * `latitude_micro`  - Latitude in microdegrees (e.g. 37_422_000 = 37.422°)
+    /// * `longitude_micro` - Longitude in microdegrees
+    /// * `country_code`    - ISO 3166-1 alpha-2 country code (e.g. "US")
+    ///
+    /// # Errors
+    /// Same as `check_in`.
+    pub fn check_in_with_geo(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+        latitude_micro: i64,
+        longitude_micro: i64,
+        country_code: String,
+    ) -> Result<(), ContractError> {
+        // Delegate to standard check_in for all validations
+        Self::check_in(env.clone(), vault_id, caller, passkey_hash)?;
+
+        let now = env.ledger().timestamp();
+        let entry = GeoCheckInEntry {
+            latitude_micro,
+            longitude_micro,
+            country_code: country_code.clone(),
+            timestamp: now,
+        };
+
+        let key = DataKey::CheckInGeoLog(vault_id);
+        let mut log: Vec<GeoCheckInEntry> = env
+            .storage().persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        log.push_back(entry);
+
+        let vault = Self::load_vault(&env, vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+
+        env.events().publish(
+            (CHECKIN_GEO_TOPIC, vault_id),
+            (latitude_micro, longitude_micro, country_code, now),
+        );
+        Ok(())
+    }
+
+    /// Returns the full geographic check-in history for a vault.
+    pub fn get_geo_checkin_log(env: Env, vault_id: u64) -> Vec<GeoCheckInEntry> {
+        env.storage().persistent()
+            .get(&DataKey::CheckInGeoLog(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     fn append_activity_log(env: &Env, vault_id: u64, action: &str, caller: &Address, _details: &str) {

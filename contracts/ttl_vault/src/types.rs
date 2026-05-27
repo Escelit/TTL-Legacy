@@ -79,6 +79,9 @@ pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 // Issue: Accelerated TTL Decay
 pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 
+// Issue: Geographic Check-in Tracking
+pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -144,6 +147,8 @@ pub enum DataKey {
     // Issue: Check-in Rate Limiting
     LastCheckInTime(u64),
     MinCheckInCooldown,
+    // Issue: Geographic Check-in Tracking
+    CheckInGeoLog(u64),
     StateTransitionLog(u64),
 }
 
@@ -156,6 +161,20 @@ pub struct TtlBorrowRecord {
     pub borrowed_seconds: u64,
     pub borrowed_at: u64,
     pub repaid: bool,
+}
+
+/// Geographic check-in entry — stores location metadata for a single check-in.
+#[contracttype]
+#[derive(Clone)]
+pub struct GeoCheckInEntry {
+    /// Latitude in microdegrees (e.g. 37_422_000 = 37.422°)
+    pub latitude_micro: i64,
+    /// Longitude in microdegrees
+    pub longitude_micro: i64,
+    /// ISO 3166-1 alpha-2 country code (e.g. "US")
+    pub country_code: String,
+    /// Ledger timestamp of the check-in
+    pub timestamp: u64,
 }
 
 /// A vesting schedule attached to a vault.

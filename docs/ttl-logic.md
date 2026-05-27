@@ -135,3 +135,22 @@ accelerate_ttl_decay(vault_id, caller, accelerate_by_seconds) -> Result<(), Cont
 - Cannot push expiry to the current time or past (must leave ≥ 1 second remaining)
 - Returns `InsufficientTtlToAccelerate` (error 55) if the remaining TTL is too small
 - Event: `ttl_acc` with `(accelerated_seconds, new_remaining_ttl)`
+
+## Geographic Check-in Tracking
+
+Check-ins can include geographic location metadata for security and anomaly detection:
+
+```rust
+check_in_with_geo(
+    vault_id, caller, passkey_hash,
+    latitude_micro, longitude_micro, country_code
+) -> Result<(), ContractError>
+get_geo_checkin_log(vault_id) -> Vec<GeoCheckInEntry>
+```
+
+- `latitude_micro` / `longitude_micro` are in microdegrees (e.g. `37_422_000` = 37.422°)
+- `country_code` is an ISO 3166-1 alpha-2 string (e.g. `"US"`)
+- All standard `check_in` validations apply (owner auth, rate limiting, passkey expiry, TTL cap)
+- Location history is stored persistently under `CheckInGeoLog(vault_id)` and queryable on-chain
+- Off-chain indexers can detect anomalies (e.g. check-in from unexpected country)
+- Events: `ci_geo` (location + timestamp) and `check_in` (standard check-in event)

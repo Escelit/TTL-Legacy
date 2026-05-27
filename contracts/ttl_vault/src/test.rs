@@ -4017,3 +4017,147 @@ fn test_accelerate_ttl_decay_multiple_calls_accumulate() {
 
     assert_eq!(ttl_start - ttl_end, 3_000u64);
 }
+
+// ============================================================
+// Issue: Geographic Check-in Tracking — tests
+// ============================================================
+
+#[test]
+fn test_check_in_with_geo_records_location() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    client.set_min_checkin_cooldown(&0u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    client.check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &37_422_000i64, &-122_084_000i64,
+        &soroban_sdk::String::from_str(&env, "US"),
+    ).unwrap();
+
+    let log = client.get_geo_checkin_log(&vault_id);
+    assert_eq!(log.len(), 1);
+    let entry = log.get(0).unwrap();
+    assert_eq!(entry.latitude_micro, 37_422_000i64);
+    assert_eq!(entry.longitude_micro, -122_084_000i64);
+}
+
+#[test]
+fn test_check_in_with_geo_emits_geo_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    client.set_min_checkin_cooldown(&0u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    client.check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &51_507_000i64, &-127_000i64,
+        &soroban_sdk::String::from_str(&env, "GB"),
+    ).unwrap();
+
+    assert!(find_event_by_topic(&env, types::CHECKIN_GEO_TOPIC));
+}
+
+#[test]
+fn test_check_in_with_geo_also_emits_standard_checkin_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    client.set_min_checkin_cooldown(&0u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    client.check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &0i64, &0i64,
+        &soroban_sdk::String::from_str(&env, "XX"),
+    ).unwrap();
+
+    assert!(find_event_by_topic(&env, types::CHECK_IN_TOPIC));
+}
+
+#[test]
+fn test_check_in_with_geo_accumulates_multiple_entries() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    client.set_min_checkin_cooldown(&0u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    client.check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &37_000_000i64, &-122_000_000i64,
+        &soroban_sdk::String::from_str(&env, "US"),
+    ).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 10);
+
+    client.check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &48_858_000i64, &2_294_000i64,
+        &soroban_sdk::String::from_str(&env, "FR"),
+    ).unwrap();
+
+    let log = client.get_geo_checkin_log(&vault_id);
+    assert_eq!(log.len(), 2);
+    assert_eq!(log.get(1).unwrap().latitude_micro, 48_858_000i64);
+}
+
+#[test]
+fn test_check_in_with_geo_fails_for_non_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let attacker = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    assert!(client.try_check_in_with_geo(
+        &vault_id, &attacker, &passkey,
+        &0i64, &0i64,
+        &soroban_sdk::String::from_str(&env, "XX"),
+    ).is_err());
+}
+
+#[test]
+fn test_get_geo_checkin_log_empty_before_any_geo_checkin() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    assert_eq!(client.get_geo_checkin_log(&vault_id).len(), 0);
+}
+
+#[test]
+fn test_check_in_with_geo_respects_rate_limit() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    client.set_min_checkin_cooldown(&300u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    client.check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &0i64, &0i64,
+        &soroban_sdk::String::from_str(&env, "US"),
+    ).unwrap();
+
+    // Immediate second geo check-in must fail due to rate limit
+    assert!(client.try_check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &0i64, &0i64,
+        &soroban_sdk::String::from_str(&env, "US"),
+    ).is_err());
+}
+
+#[test]
+fn test_check_in_with_geo_stores_correct_timestamp() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    client.set_min_checkin_cooldown(&0u64);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+
+    env.ledger().with_mut(|l| l.timestamp += 999);
+    let expected_ts = env.ledger().timestamp();
+
+    client.check_in_with_geo(
+        &vault_id, &owner, &passkey,
+        &0i64, &0i64,
+        &soroban_sdk::String::from_str(&env, "DE"),
+    ).unwrap();
+
+    let entry = client.get_geo_checkin_log(&vault_id).get(0).unwrap();
+    assert_eq!(entry.timestamp, expected_ts);
+}
