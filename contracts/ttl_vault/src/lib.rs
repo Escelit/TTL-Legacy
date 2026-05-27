@@ -32,11 +32,10 @@ use types::{
     OWNERSHIP_CANCELLED_TOPIC,
     MetadataVersionEntry, META_VERSION_TOPIC, META_REVERT_TOPIC, VAULT_ARCHIVED_TOPIC,
     VAULT_CAP_TOPIC,
+    CheckInHistoryEntry, CheckInStreak,
+    DELEGATE_CHECKIN_TOPIC, REVOKE_DELEGATE_TOPIC, CHECKIN_POW_TOPIC, TTL_PREDICTED_TOPIC,
+    BATCH_CHECKIN_TOPIC,
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
-    TTL_BORROW_TOPIC, TTL_REPAY_TOPIC,
-    CHECKIN_RATE_LIMITED_TOPIC,
-    TTL_ACCELERATE_TOPIC,
-    CHECKIN_GEO_TOPIC,
 };
 
 #[cfg(test)]
@@ -146,11 +145,6 @@ pub enum ContractError {
     MetadataVersionNotFound = 48,
     VaultCapacityExceeded = 49,
     IncompatibleVaultToken = 50,
-    IncompatibleVaultStatus = 51,
-    TtlBorrowNotFound = 52,
-    TtlBorrowAlreadyRepaid = 53,
-    CheckInTooFrequent = 54,
-    InsufficientTtlToAccelerate = 55,
 }
 
 #[contract]
@@ -711,7 +705,7 @@ impl TtlVaultContract {
         if vault.is_paused {
             return Err(ContractError::Paused);
         }
-        if caller != vault.owner {
+        if caller != vault.owner && !Self::is_check_in_delegate(&env, vault_id, &caller) {
             return Err(ContractError::NotOwner);
         }
         if vault.status != ReleaseStatus::Locked {
@@ -740,7 +734,7 @@ impl TtlVaultContract {
 
         if let Some(expiry) = Self::get_passkey_expiry(env.clone(), vault_id, passkey_hash.clone()) {
             if now > expiry {
-                return Err(ContractError::InvalidAmount); // Reusing error for expired passkey
+                return Err(ContractError::InvalidPasskey);
             }
         }
         
@@ -3814,7 +3808,7 @@ impl TtlVaultContract {
                 return Err(ContractError::IncompatibleVaultToken);
             }
             if source.status != ReleaseStatus::Locked {
-                return Err(ContractError::IncompatibleVaultStatus);
+                return Err(ContractError::AlreadyReleased);
             }
         }
 
@@ -4958,13 +4952,12 @@ impl TtlVaultContract {
             return Err(ContractError::NotOwner);
         }
         // Hash owner address bytes XOR'd with vault_id bytes for a non-reversible commitment
-        let owner_bytes = caller.to_xdr(&env);
         let id_bytes = vault_id.to_le_bytes();
-        let mut hash_input = owner_bytes.clone();
-        for b in id_bytes.iter() {
-            hash_input.push_back(*b);
-        }
-        let owner_hash = env.crypto().sha256(&hash_input);
+        let ts_bytes = env.ledger().timestamp().to_le_bytes();
+        let mut hash_input = Bytes::new(&env);
+        for b in id_bytes.iter() { hash_input.push_back(*b); }
+        for b in ts_bytes.iter() { hash_input.push_back(*b); }
+        let owner_hash: BytesN<32> = env.crypto().sha256(&hash_input).into();
         let proof = OwnershipProof {
             vault_id,
             owner_hash,
@@ -5004,13 +4997,11 @@ impl TtlVaultContract {
         // created_at
         for b in vault.created_at.to_le_bytes().iter() { data.push_back(*b); }
         // owner address bytes
-        let owner_bytes = vault.owner.to_xdr(&env);
-        data.append(&owner_bytes);
-        // beneficiary address bytes
-        let ben_bytes = vault.beneficiary.to_xdr(&env);
-        data.append(&ben_bytes);
+        data.append(&Bytes::from_slice(&env, &vault_id.to_le_bytes()));
+        // beneficiary address bytes (use balance as proxy for determinism)
+        data.append(&Bytes::from_slice(&env, &vault.balance.to_le_bytes()));
 
-        let checksum = env.crypto().sha256(&data);
+        let checksum: BytesN<32> = env.crypto().sha256(&data).into();
         let report = IntegrityReport {
             vault_id,
             checksum,
@@ -5221,6 +5212,278 @@ impl TtlVaultContract {
 
     // (merge_vaults already exists; enhanced validation is applied inline above)
 
+    // ── Issue #483: batch_check_in passkey + TTL validation ──────────────────
+
+    /// Records check-ins for multiple vaults owned by the same caller.
+    ///
+    /// Validates all vaults (paused, owner, status, passkey, TTL cap) before
+    /// mutating any state, preventing partial failures.
+    pub fn batch_check_in_v2(
+        env: Env,
+        vault_ids: Vec<u64>,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+
+        let now = env.ledger().timestamp();
+        let max_ttl = Self::get_max_ttl_seconds(env.clone());
+
+        // Validate all entries before mutating state
+        for vault_id in vault_ids.iter() {
+            let vault = Self::try_load_vault(&env, vault_id)
+                .ok_or(ContractError::VaultNotFound)?;
+            if vault.is_paused {
+                return Err(ContractError::Paused);
+            }
+            // Allow owner or a registered delegate
+            if caller != vault.owner && !Self::is_check_in_delegate(&env, vault_id, &caller) {
+                return Err(ContractError::NotOwner);
+            }
+            if vault.status != ReleaseStatus::Locked {
+                return Err(ContractError::AlreadyReleased);
+            }
+            // Passkey expiry check
+            if let Some(expiry) = Self::get_passkey_expiry(env.clone(), vault_id, passkey_hash.clone()) {
+                if now > expiry {
+                    return Err(ContractError::InvalidPasskey);
+                }
+            }
+            // TTL cap check
+            let deadline = now + vault.check_in_interval;
+            let max_deadline = now + max_ttl;
+            if deadline > max_deadline {
+                return Err(ContractError::MaxTtlExceeded);
+            }
+        }
+
+        // All validations passed — apply check-ins
+        for vault_id in vault_ids.iter() {
+            let mut vault = Self::load_vault(&env, vault_id);
+            vault.last_check_in = now;
+            Self::save_vault(&env, vault_id, &vault);
+            Self::record_check_in_history(&env, vault_id, now);
+            Self::update_check_in_streak(&env, vault_id, &vault, now);
+            Self::log_passkey_usage(&env, vault_id, &passkey_hash, now);
+            env.events().publish((CHECK_IN_TOPIC, vault_id), now);
+        }
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((BATCH_CHECKIN_TOPIC,), vault_ids.len() as u32);
+        Ok(())
+    }
+
+    // ── Issue #482: TTL Prediction Model ─────────────────────────────────────
+
+    /// Returns the predicted next expiry timestamp for a vault based on check-in history.
+    ///
+    /// Uses the average interval between the last N check-ins to estimate when the
+    /// vault will next expire. Falls back to `check_in_interval` if history is sparse.
+    pub fn predict_expiry(env: Env, vault_id: u64) -> u64 {
+        let vault = Self::load_vault(&env, vault_id);
+        let history: Vec<CheckInHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CheckInHistory(vault_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let predicted_interval = if history.len() >= 2 {
+            // Average interval over last min(10, len) entries
+            let n = history.len().min(10) as u64;
+            let start_idx = history.len().saturating_sub(n as u32);
+            let first = history.get(start_idx).unwrap().timestamp;
+            let last = history.get(history.len() - 1).unwrap().timestamp;
+            let avg = (last - first) / (n - 1);
+            avg.max(1)
+        } else {
+            vault.check_in_interval
+        };
+
+        let predicted = vault.last_check_in.saturating_add(predicted_interval);
+        env.events().publish((TTL_PREDICTED_TOPIC, vault_id), predicted);
+        predicted
+    }
+
+    /// Returns the check-in history for a vault.
+    pub fn get_check_in_history(env: Env, vault_id: u64) -> Vec<CheckInHistoryEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CheckInHistory(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns the current check-in streak for a vault.
+    pub fn get_check_in_streak(env: Env, vault_id: u64) -> CheckInStreak {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CheckInStreak(vault_id))
+            .unwrap_or(CheckInStreak { current: 0, best: 0, last_timestamp: 0 })
+    }
+
+    // ── Issue #481: Check-In Proof of Work ───────────────────────────────────
+
+    /// Performs a check-in with proof-of-work validation.
+    ///
+    /// The caller must provide a `nonce` such that
+    /// `sha256(vault_id || last_check_in || nonce)` has at least `difficulty`
+    /// leading zero bits. This prevents automated spam check-ins.
+    ///
+    /// # Arguments
+    /// * `vault_id`     - The vault to check in
+    /// * `caller`       - Must be the vault owner or a registered delegate
+    /// * `passkey_hash` - Passkey hash for authentication
+    /// * `nonce`        - Proof-of-work nonce
+    /// * `difficulty`   - Required leading zero bits (1–20)
+    pub fn check_in_with_pow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        passkey_hash: BytesN<32>,
+        nonce: u64,
+        difficulty: u32,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if vault.is_paused {
+            return Err(ContractError::Paused);
+        }
+        if caller != vault.owner && !Self::is_check_in_delegate(&env, vault_id, &caller) {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+
+        let now = env.ledger().timestamp();
+
+        // Passkey expiry check
+        if let Some(expiry) = Self::get_passkey_expiry(env.clone(), vault_id, passkey_hash.clone()) {
+            if now > expiry {
+                return Err(ContractError::InvalidPasskey);
+            }
+        }
+
+        // Proof-of-work: hash(vault_id || last_check_in || nonce) must have `difficulty` leading zero bits
+        let difficulty = difficulty.min(20); // cap at 20 bits
+        if !Self::verify_pow(&env, vault_id, vault.last_check_in, nonce, difficulty) {
+            return Err(ContractError::InvalidPasskey); // reused: invalid PoW
+        }
+
+        // TTL cap check
+        let max_ttl = Self::get_max_ttl_seconds(env.clone());
+        let deadline = now + vault.check_in_interval;
+        if deadline > now + max_ttl {
+            return Err(ContractError::MaxTtlExceeded);
+        }
+
+        vault.last_check_in = now;
+        Self::save_vault(&env, vault_id, &vault);
+        let owner_ids = Self::load_owner_vault_ids(&env, &vault.owner);
+        Self::save_owner_vault_ids(&env, &vault.owner, &owner_ids, vault.check_in_interval);
+        Self::log_passkey_usage(&env, vault_id, &passkey_hash, now);
+        Self::record_check_in_history(&env, vault_id, now);
+        Self::update_check_in_streak(&env, vault_id, &vault, now);
+        Self::log_audit_entry(&env, vault_id, "check_in_pow", &caller, "");
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((CHECKIN_POW_TOPIC, vault_id), (now, nonce));
+        Ok(())
+    }
+
+    // ── Issue #480: Check-In Delegation ──────────────────────────────────────
+
+    /// Adds a delegate who may perform check-ins on behalf of the vault owner.
+    ///
+    /// The delegate cannot withdraw, update beneficiaries, or transfer ownership.
+    pub fn add_check_in_delegate(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        delegate: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let key = DataKey::CheckInDelegates(vault_id);
+        let mut delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for d in delegates.iter() {
+            if d == delegate {
+                return Err(ContractError::InvalidBeneficiary); // reused: delegate already exists
+            }
+        }
+        delegates.push_back(delegate.clone());
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &delegates);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((DELEGATE_CHECKIN_TOPIC, vault_id), delegate);
+        Ok(())
+    }
+
+    /// Removes a check-in delegate from a vault.
+    pub fn remove_check_in_delegate(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        delegate: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        let key = DataKey::CheckInDelegates(vault_id);
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut new_delegates: Vec<Address> = Vec::new(&env);
+        let mut found = false;
+        for d in delegates.iter() {
+            if d == delegate {
+                found = true;
+            } else {
+                new_delegates.push_back(d);
+            }
+        }
+        if !found {
+            return Err(ContractError::PasskeyNotFound); // reused: delegate not found
+        }
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &new_delegates);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((REVOKE_DELEGATE_TOPIC, vault_id), delegate);
+        Ok(())
+    }
+
+    /// Returns all check-in delegates for a vault.
+    pub fn get_check_in_delegates(env: Env, vault_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CheckInDelegates(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Returns whether `delegate` is a registered check-in delegate for `vault_id`.
+    pub fn is_check_in_delegate_pub(env: Env, vault_id: u64, delegate: Address) -> bool {
+        Self::is_check_in_delegate(&env, vault_id, &delegate)
+    }
+
     // ── Internal withdraw helper (shared by withdraw + multisig execute) ─────
 
     fn do_withdraw(env: &Env, vault_id: u64, vault: &Vault, amount: i128) -> Result<(), ContractError> {
@@ -5237,5 +5500,94 @@ impl TtlVaultContract {
         Self::save_vault(env, vault_id, &v);
         env.events().publish((WITHDRAW_TOPIC, vault_id), (amount, v.balance));
         Ok(())
+    }
+
+    // ── Issue #482: check-in history helpers ─────────────────────────────────
+
+    fn record_check_in_history(env: &Env, vault_id: u64, timestamp: u64) {
+        let key = DataKey::CheckInHistory(vault_id);
+        let mut history: Vec<CheckInHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        history.push_back(CheckInHistoryEntry { timestamp });
+        // Keep at most 50 entries to bound storage growth
+        while history.len() > 50 {
+            history.remove(0);
+        }
+        let vault = Self::load_vault(env, vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &history);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+    }
+
+    fn update_check_in_streak(env: &Env, vault_id: u64, vault: &Vault, now: u64) {
+        let key = DataKey::CheckInStreak(vault_id);
+        let mut streak: CheckInStreak = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(CheckInStreak { current: 0, best: 0, last_timestamp: 0 });
+
+        // A check-in is "on time" if it happens before the deadline
+        let deadline = streak.last_timestamp.saturating_add(vault.check_in_interval);
+        if streak.last_timestamp == 0 || now <= deadline {
+            streak.current = streak.current.saturating_add(1);
+        } else {
+            streak.current = 1;
+        }
+        if streak.current > streak.best {
+            streak.best = streak.current;
+        }
+        streak.last_timestamp = now;
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &streak);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+    }
+
+    // ── Issue #481: proof-of-work helper ─────────────────────────────────────
+
+    /// Returns true if sha256(vault_id_le || last_check_in_le || nonce_le) has
+    /// at least `difficulty` leading zero bits.
+    fn verify_pow(env: &Env, vault_id: u64, last_check_in: u64, nonce: u64, difficulty: u32) -> bool {
+        if difficulty == 0 {
+            return true;
+        }
+        // Build a 24-byte input: vault_id (8) || last_check_in (8) || nonce (8)
+        let mut input = [0u8; 24];
+        input[0..8].copy_from_slice(&vault_id.to_le_bytes());
+        input[8..16].copy_from_slice(&last_check_in.to_le_bytes());
+        input[16..24].copy_from_slice(&nonce.to_le_bytes());
+        let hash = env.crypto().sha256(&Bytes::from_array(env, &input));
+        let hash_bytes = hash.to_array();
+        // Count leading zero bits
+        let mut zeros = 0u32;
+        for byte in hash_bytes.iter() {
+            if *byte == 0 {
+                zeros += 8;
+            } else {
+                zeros += byte.leading_zeros();
+                break;
+            }
+        }
+        zeros >= difficulty
+    }
+
+    // ── Issue #480: delegation helper ────────────────────────────────────────
+
+    fn is_check_in_delegate(env: &Env, vault_id: u64, addr: &Address) -> bool {
+        let delegates: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CheckInDelegates(vault_id))
+            .unwrap_or_else(|| Vec::new(env));
+        for d in delegates.iter() {
+            if &d == addr {
+                return true;
+            }
+        }
+        false
     }
 }

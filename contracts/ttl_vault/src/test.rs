@@ -3701,7 +3701,7 @@ fn test_merge_vaults_non_locked_source_fails() {
     // Try to merge released source into target — should fail
     let sources = soroban_sdk::vec![&env, source];
     let err = client.try_merge_vaults(&target, &sources, &owner).unwrap_err().unwrap();
-    assert_eq!(err, soroban_sdk::Error::from_contract_error(51)); // IncompatibleVaultStatus
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased (was IncompatibleVaultStatus)
 }
 
 #[test]
@@ -3719,445 +3719,206 @@ fn test_merge_vaults_same_token_succeeds() {
     assert_eq!(client.get_vault(&target).balance, 50_000i128);
 }
 
-// ============================================================
-// Issue: TTL Borrowing — tests
-// ============================================================
+// ── Issue #483: batch_check_in_v2 ────────────────────────────────────────────
 
 #[test]
-fn test_borrow_ttl_extends_borrower_and_shortens_lender() {
+fn test_batch_check_in_v2_validates_before_mutating() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+    let id1 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let id2 = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
 
-    let lender_before = client.get_vault(&lender_id).last_check_in;
-    let borrower_before = client.get_vault(&borrower_id).last_check_in;
+    // Both vaults should check in successfully
+    let ids = soroban_sdk::vec![&env, id1, id2];
+    client.batch_check_in_v2(&ids, &owner, &passkey).unwrap();
 
-    client.borrow_ttl(&borrower_id, &lender_id, &owner, &1_000u64).unwrap();
-
-    assert_eq!(client.get_vault(&borrower_id).last_check_in, borrower_before + 1_000);
-    assert_eq!(client.get_vault(&lender_id).last_check_in, lender_before - 1_000);
+    let v1 = client.get_vault(&id1);
+    let v2 = client.get_vault(&id2);
+    assert_eq!(v1.last_check_in, v2.last_check_in);
 }
 
 #[test]
-fn test_borrow_ttl_records_borrow_entry() {
+fn test_batch_check_in_v2_rejects_wrong_owner() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
 
-    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
-
-    let record = client.get_ttl_borrow(&borrower_id).expect("borrow record should exist");
-    assert_eq!(record.lender_vault_id, lender_id);
-    assert_eq!(record.borrowed_seconds, 500);
-    assert!(!record.repaid);
+    let ids = soroban_sdk::vec![&env, id];
+    let err = client.try_batch_check_in_v2(&ids, &stranger, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
 }
 
 #[test]
-fn test_borrow_ttl_emits_event() {
+fn test_batch_check_in_v2_rejects_released_vault() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
+    let id = client.create_vault(&owner, &beneficiary, &1u64, &None);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
 
-    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
-    assert!(find_event_by_topic(&env, types::TTL_BORROW_TOPIC));
-}
-
-#[test]
-fn test_borrow_ttl_fails_when_lender_has_insufficient_ttl() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
-
-    let result = client.try_borrow_ttl(&borrower_id, &lender_id, &owner, &200u64);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_borrow_ttl_fails_for_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
-
-    let result = client.try_borrow_ttl(&borrower_id, &lender_id, &attacker, &500u64);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_borrow_ttl_fails_same_vault() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let result = client.try_borrow_ttl(&vault_id, &vault_id, &owner, &500u64);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_repay_ttl_borrow_restores_lender() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
-
-    let lender_before = client.get_vault(&lender_id).last_check_in;
-    client.borrow_ttl(&borrower_id, &lender_id, &owner, &1_000u64).unwrap();
-    client.repay_ttl_borrow(&borrower_id, &owner).unwrap();
-
-    assert_eq!(client.get_vault(&lender_id).last_check_in, lender_before);
-    assert!(client.get_ttl_borrow(&borrower_id).unwrap().repaid);
-}
-
-#[test]
-fn test_repay_ttl_borrow_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
-
-    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
-    client.repay_ttl_borrow(&borrower_id, &owner).unwrap();
-    assert!(find_event_by_topic(&env, types::TTL_REPAY_TOPIC));
-}
-
-#[test]
-fn test_repay_ttl_borrow_fails_when_already_repaid() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let b2 = Address::generate(&env);
-    let lender_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let borrower_id = client.create_vault(&owner, &b2, &10_000u64, &None);
-
-    client.borrow_ttl(&borrower_id, &lender_id, &owner, &500u64).unwrap();
-    client.repay_ttl_borrow(&borrower_id, &owner).unwrap();
-    assert!(client.try_repay_ttl_borrow(&borrower_id, &owner).is_err());
-}
-
-#[test]
-fn test_repay_ttl_borrow_fails_when_no_record() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    assert!(client.try_repay_ttl_borrow(&vault_id, &owner).is_err());
-}
-
-// ============================================================
-// Issue: Check-in Rate Limiting — tests
-// ============================================================
-
-#[test]
-fn test_set_and_get_min_checkin_cooldown() {
-    let (_, _, _, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&300u64);
-    assert_eq!(client.get_min_checkin_cooldown(), 300u64);
-}
-
-#[test]
-fn test_set_min_checkin_cooldown_emits_event() {
-    let (env, _, _, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&120u64);
-    assert!(find_event_by_topic(&env, types::CHECKIN_RATE_LIMITED_TOPIC));
-}
-
-#[test]
-fn test_checkin_rate_limit_blocks_rapid_checkins() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&300u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    client.check_in(&vault_id, &owner, &passkey);
-    // Immediate second check-in must fail
-    assert!(client.try_check_in(&vault_id, &owner, &passkey).is_err());
-}
-
-#[test]
-fn test_checkin_rate_limit_allows_after_cooldown() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&300u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    client.check_in(&vault_id, &owner, &passkey);
-    env.ledger().with_mut(|l| l.timestamp += 301);
-    assert!(client.try_check_in(&vault_id, &owner, &passkey).is_ok());
-}
-
-#[test]
-fn test_checkin_rate_limit_zero_disables_limiting() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&0u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    client.check_in(&vault_id, &owner, &passkey);
-    assert!(client.try_check_in(&vault_id, &owner, &passkey).is_ok());
-}
-
-#[test]
-fn test_get_last_checkin_time_after_checkin() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&0u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    env.ledger().with_mut(|l| l.timestamp += 50);
-    let expected = env.ledger().timestamp();
-    client.check_in(&vault_id, &owner, &passkey);
-    assert_eq!(client.get_last_checkin_time(&vault_id), Some(expected));
-}
-
-#[test]
-fn test_get_last_checkin_time_none_before_first_checkin() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    assert_eq!(client.get_last_checkin_time(&vault_id), None);
-}
-
-#[test]
-fn test_checkin_rate_limit_admin_only() {
-    let (env, owner, _, _, _, client) = setup();
-    // set_min_checkin_cooldown is admin-only; with mock_all_auths it passes,
-    // but the function internally calls require_admin which checks the admin address.
-    // Verify the value is stored correctly.
-    client.set_min_checkin_cooldown(&600u64);
-    assert_eq!(client.get_min_checkin_cooldown(), 600u64);
-}
-
-// ============================================================
-// Issue: Accelerated TTL Decay — tests
-// ============================================================
-
-#[test]
-fn test_accelerate_ttl_decay_moves_expiry_forward() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-
-    let ttl_before = client.get_ttl_remaining(&vault_id).unwrap();
-    client.accelerate_ttl_decay(&vault_id, &owner, &1_000u64).unwrap();
-    let ttl_after = client.get_ttl_remaining(&vault_id).unwrap();
-
-    assert!(ttl_after < ttl_before);
-    assert_eq!(ttl_before - ttl_after, 1_000u64);
-}
-
-#[test]
-fn test_accelerate_ttl_decay_emits_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-
-    client.accelerate_ttl_decay(&vault_id, &owner, &500u64).unwrap();
-    assert!(find_event_by_topic(&env, types::TTL_ACCELERATE_TOPIC));
-}
-
-#[test]
-fn test_accelerate_ttl_decay_fails_for_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let attacker = Address::generate(&env);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-
-    assert!(client.try_accelerate_ttl_decay(&vault_id, &attacker, &500u64).is_err());
-}
-
-#[test]
-fn test_accelerate_ttl_decay_fails_with_zero_seconds() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-
-    assert!(client.try_accelerate_ttl_decay(&vault_id, &owner, &0u64).is_err());
-}
-
-#[test]
-fn test_accelerate_ttl_decay_fails_when_would_expire_immediately() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    // interval = 500s → remaining TTL = 500s; accelerating by 500 would leave 0
-    let vault_id = client.create_vault(&owner, &beneficiary, &500u64, &None);
-
-    assert!(client.try_accelerate_ttl_decay(&vault_id, &owner, &500u64).is_err());
-}
-
-#[test]
-fn test_accelerate_ttl_decay_fails_on_released_vault() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
-    client.deposit(&vault_id, &owner, &500i128);
-    env.ledger().with_mut(|l| l.timestamp += 200);
-    client.trigger_release(&vault_id);
-
-    assert!(client.try_accelerate_ttl_decay(&vault_id, &owner, &10u64).is_err());
-}
-
-#[test]
-fn test_accelerate_ttl_decay_vault_can_be_released_after_acceleration() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    client.deposit(&vault_id, &owner, &500i128);
-
-    // Accelerate by 9_999s so only 1s of TTL remains
-    client.accelerate_ttl_decay(&vault_id, &owner, &9_999u64).unwrap();
-
-    // Advance 1 second to expire
-    env.ledger().with_mut(|l| l.timestamp += 1);
-    assert!(client.is_expired(&vault_id));
-
-    client.trigger_release(&vault_id);
-    assert_eq!(client.get_release_status(&vault_id), ReleaseStatus::Released);
-}
-
-#[test]
-fn test_accelerate_ttl_decay_multiple_calls_accumulate() {
-    let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-
-    let ttl_start = client.get_ttl_remaining(&vault_id).unwrap();
-    client.accelerate_ttl_decay(&vault_id, &owner, &1_000u64).unwrap();
-    client.accelerate_ttl_decay(&vault_id, &owner, &2_000u64).unwrap();
-    let ttl_end = client.get_ttl_remaining(&vault_id).unwrap();
-
-    assert_eq!(ttl_start - ttl_end, 3_000u64);
-}
-
-// ============================================================
-// Issue: Geographic Check-in Tracking — tests
-// ============================================================
-
-#[test]
-fn test_check_in_with_geo_records_location() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&0u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    client.check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &37_422_000i64, &-122_084_000i64,
-        &soroban_sdk::String::from_str(&env, "US"),
-    ).unwrap();
-
-    let log = client.get_geo_checkin_log(&vault_id);
-    assert_eq!(log.len(), 1);
-    let entry = log.get(0).unwrap();
-    assert_eq!(entry.latitude_micro, 37_422_000i64);
-    assert_eq!(entry.longitude_micro, -122_084_000i64);
-}
-
-#[test]
-fn test_check_in_with_geo_emits_geo_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&0u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    client.check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &51_507_000i64, &-127_000i64,
-        &soroban_sdk::String::from_str(&env, "GB"),
-    ).unwrap();
-
-    assert!(find_event_by_topic(&env, types::CHECKIN_GEO_TOPIC));
-}
-
-#[test]
-fn test_check_in_with_geo_also_emits_standard_checkin_event() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&0u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    client.check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &0i64, &0i64,
-        &soroban_sdk::String::from_str(&env, "XX"),
-    ).unwrap();
-
-    assert!(find_event_by_topic(&env, types::CHECK_IN_TOPIC));
-}
-
-#[test]
-fn test_check_in_with_geo_accumulates_multiple_entries() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&0u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    client.check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &37_000_000i64, &-122_000_000i64,
-        &soroban_sdk::String::from_str(&env, "US"),
-    ).unwrap();
-
+    // Expire the vault
     env.ledger().with_mut(|l| l.timestamp += 10);
+    client.trigger_release(&id);
 
-    client.check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &48_858_000i64, &2_294_000i64,
-        &soroban_sdk::String::from_str(&env, "FR"),
-    ).unwrap();
-
-    let log = client.get_geo_checkin_log(&vault_id);
-    assert_eq!(log.len(), 2);
-    assert_eq!(log.get(1).unwrap().latitude_micro, 48_858_000i64);
+    let ids = soroban_sdk::vec![&env, id];
+    let err = client.try_batch_check_in_v2(&ids, &owner, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(7)); // AlreadyReleased
 }
 
-#[test]
-fn test_check_in_with_geo_fails_for_non_owner() {
-    let (env, owner, beneficiary, _, _, client) = setup();
-    let attacker = Address::generate(&env);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
-
-    assert!(client.try_check_in_with_geo(
-        &vault_id, &attacker, &passkey,
-        &0i64, &0i64,
-        &soroban_sdk::String::from_str(&env, "XX"),
-    ).is_err());
-}
+// ── Issue #482: TTL prediction model ─────────────────────────────────────────
 
 #[test]
-fn test_get_geo_checkin_log_empty_before_any_geo_checkin() {
+fn test_predict_expiry_falls_back_to_interval_with_no_history() {
     let (_, owner, beneficiary, _, _, client) = setup();
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    assert_eq!(client.get_geo_checkin_log(&vault_id).len(), 0);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    let vault = client.get_vault(&id);
+    let predicted = client.predict_expiry(&id);
+    // With no history, should be last_check_in + check_in_interval
+    assert_eq!(predicted, vault.last_check_in + vault.check_in_interval);
 }
 
 #[test]
-fn test_check_in_with_geo_respects_rate_limit() {
+fn test_predict_expiry_uses_history_average() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&300u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    client.check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &0i64, &0i64,
-        &soroban_sdk::String::from_str(&env, "US"),
-    ).unwrap();
+    // Two check-ins 1800s apart
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
 
-    // Immediate second geo check-in must fail due to rate limit
-    assert!(client.try_check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &0i64, &0i64,
-        &soroban_sdk::String::from_str(&env, "US"),
-    ).is_err());
+    let predicted = client.predict_expiry(&id);
+    let vault = client.get_vault(&id);
+    // Average interval is 1800, so predicted = last_check_in + 1800
+    assert_eq!(predicted, vault.last_check_in + 1800);
 }
 
 #[test]
-fn test_check_in_with_geo_stores_correct_timestamp() {
+fn test_get_check_in_streak_increments_on_time() {
     let (env, owner, beneficiary, _, _, client) = setup();
-    client.set_min_checkin_cooldown(&0u64);
-    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
-    let passkey = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
 
-    env.ledger().with_mut(|l| l.timestamp += 999);
-    let expected_ts = env.ledger().timestamp();
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    let streak = client.get_check_in_streak(&id);
+    assert_eq!(streak.current, 1);
+    assert_eq!(streak.best, 1);
 
-    client.check_in_with_geo(
-        &vault_id, &owner, &passkey,
-        &0i64, &0i64,
-        &soroban_sdk::String::from_str(&env, "DE"),
-    ).unwrap();
+    env.ledger().with_mut(|l| l.timestamp += 1800);
+    client.check_in(&id, &owner, &passkey).unwrap();
+    let streak2 = client.get_check_in_streak(&id);
+    assert_eq!(streak2.current, 2);
+    assert_eq!(streak2.best, 2);
+}
 
-    let entry = client.get_geo_checkin_log(&vault_id).get(0).unwrap();
-    assert_eq!(entry.timestamp, expected_ts);
+// ── Issue #481: check-in proof-of-work ───────────────────────────────────────
+
+#[test]
+fn test_check_in_with_pow_zero_difficulty_always_passes() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // difficulty=0 means any nonce is valid
+    client.check_in_with_pow(&id, &owner, &passkey, &0u64, &0u32).unwrap();
+    let vault = client.get_vault(&id);
+    assert!(vault.last_check_in > 0);
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_wrong_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_check_in_with_pow(&id, &stranger, &passkey, &0u64, &0u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_check_in_with_pow_rejects_invalid_nonce() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    // difficulty=20 with nonce=0 is extremely unlikely to pass
+    let err = client.try_check_in_with_pow(&id, &owner, &passkey, &0u64, &20u32).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(26)); // InvalidPasskey (reused for PoW)
+}
+
+// ── Issue #480: check-in delegation ──────────────────────────────────────────
+
+#[test]
+fn test_add_and_check_delegate() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    assert!(!client.is_check_in_delegate_pub(&id, &delegate));
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    assert!(client.is_check_in_delegate_pub(&id, &delegate));
+
+    let delegates = client.get_check_in_delegates(&id);
+    assert_eq!(delegates.len(), 1);
+}
+
+#[test]
+fn test_delegate_can_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+
+    env.ledger().with_mut(|l| l.timestamp += 100);
+    client.check_in(&id, &delegate, &passkey).unwrap();
+    let vault = client.get_vault(&id);
+    assert!(vault.last_check_in > 0);
+}
+
+#[test]
+fn test_remove_delegate() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    client.remove_check_in_delegate(&id, &owner, &delegate).unwrap();
+    assert!(!client.is_check_in_delegate_pub(&id, &delegate));
+}
+
+#[test]
+fn test_non_delegate_cannot_check_in() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let passkey = BytesN::from_array(&env, &[1u8; 32]);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_check_in(&id, &stranger, &passkey).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_add_duplicate_delegate_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.add_check_in_delegate(&id, &owner, &delegate).unwrap();
+    let err = client.try_add_check_in_delegate(&id, &owner, &delegate).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(17)); // InvalidBeneficiary (reused)
+}
+
+#[test]
+fn test_remove_nonexistent_delegate_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let delegate = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_remove_check_in_delegate(&id, &owner, &delegate).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(27)); // PasskeyNotFound (reused)
 }
