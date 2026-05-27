@@ -34,6 +34,7 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     TTL_BORROW_TOPIC, TTL_REPAY_TOPIC,
     CHECKIN_RATE_LIMITED_TOPIC,
+    TTL_ACCELERATE_TOPIC,
 };
 
 #[cfg(test)]
@@ -75,6 +76,9 @@ const OWNERSHIP_TRANSFER_EXPIRY: u64 = 604_800;
 
 /// Minimum seconds between consecutive check-ins (default: 60 seconds).
 const DEFAULT_MIN_CHECKIN_COOLDOWN: u64 = 60;
+
+/// Maximum seconds an owner can accelerate TTL decay per call (30 days).
+const MAX_ACCELERATE_SECONDS: u64 = 2_592_000;
 
 /// Compute a persistent storage TTL (in ledgers) for a vault with the given
 /// check-in interval. Applies a 2× safety buffer so storage outlives the
@@ -144,6 +148,7 @@ pub enum ContractError {
     TtlBorrowNotFound = 52,
     TtlBorrowAlreadyRepaid = 53,
     CheckInTooFrequent = 54,
+    InsufficientTtlToAccelerate = 55,
 }
 
 #[contract]
@@ -3247,6 +3252,62 @@ impl TtlVaultContract {
     /// Returns `None` if no check-in has been recorded yet.
     pub fn get_last_checkin_time(env: Env, vault_id: u64) -> Option<u64> {
         env.storage().persistent().get(&DataKey::LastCheckInTime(vault_id))
+    }
+
+    // ── Issue: Accelerated TTL Decay ──────────────────────────────────────────
+
+    /// Allows the vault owner to accelerate TTL decay, making the vault expire sooner.
+    ///
+    /// Reduces `last_check_in` by `accelerate_by_seconds`, moving the expiry deadline
+    /// forward. Capped at `MAX_ACCELERATE_SECONDS` (30 days) per call. Cannot push
+    /// the deadline to the current time or past (must leave ≥ 1 second remaining).
+    ///
+    /// # Arguments
+    /// * `vault_id`              - The vault to accelerate
+    /// * `caller`                - Must be the vault owner
+    /// * `accelerate_by_seconds` - Seconds to shorten the remaining TTL by
+    ///
+    /// # Errors
+    /// * `Paused`                    - contract is paused
+    /// * `NotOwner`                  - caller is not vault owner
+    /// * `AlreadyReleased`           - vault is not Locked
+    /// * `InvalidAmount`             - accelerate_by_seconds is 0 or exceeds cap
+    /// * `InsufficientTtlToAccelerate` - would push expiry to now or past
+    pub fn accelerate_ttl_decay(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        accelerate_by_seconds: u64,
+    ) -> Result<(), ContractError> {
+        if Self::load_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+        caller.require_auth();
+        if accelerate_by_seconds == 0 || accelerate_by_seconds > MAX_ACCELERATE_SECONDS {
+            return Err(ContractError::InvalidAmount);
+        }
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let now = env.ledger().timestamp();
+        let current_deadline = vault.last_check_in + vault.check_in_interval;
+        let remaining = if now >= current_deadline { 0u64 } else { current_deadline - now };
+        // Must leave at least 1 second of TTL remaining
+        if remaining <= accelerate_by_seconds {
+            return Err(ContractError::InsufficientTtlToAccelerate);
+        }
+        vault.last_check_in = vault.last_check_in.saturating_sub(accelerate_by_seconds);
+        Self::save_vault(&env, vault_id, &vault);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (TTL_ACCELERATE_TOPIC, vault_id),
+            (accelerate_by_seconds, remaining - accelerate_by_seconds),
+        );
+        Ok(())
     }
 
     fn append_activity_log(env: &Env, vault_id: u64, action: &str, caller: &Address, _details: &str) {

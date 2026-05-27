@@ -121,3 +121,17 @@ get_last_checkin_time(vault_id) -> Option<u64>
 - Set to 0 to disable rate limiting
 - Check-ins within the cooldown window return `CheckInTooFrequent` (error 54)
 - Event: `ci_rl` emitted when the cooldown setting is updated
+
+## Accelerated TTL Decay
+
+Owners can voluntarily shorten their vault's remaining TTL to make it expire sooner:
+
+```rust
+accelerate_ttl_decay(vault_id, caller, accelerate_by_seconds) -> Result<(), ContractError>
+```
+
+- Reduces `last_check_in` by `accelerate_by_seconds`, moving the expiry deadline forward
+- Capped at 30 days (`MAX_ACCELERATE_SECONDS = 2_592_000`) per call
+- Cannot push expiry to the current time or past (must leave ≥ 1 second remaining)
+- Returns `InsufficientTtlToAccelerate` (error 55) if the remaining TTL is too small
+- Event: `ttl_acc` with `(accelerated_seconds, new_remaining_ttl)`

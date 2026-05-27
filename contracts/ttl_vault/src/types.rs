@@ -76,6 +76,9 @@ pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 // Issue: Check-in Rate Limiting
 pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 
+// Issue: Accelerated TTL Decay
+pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 

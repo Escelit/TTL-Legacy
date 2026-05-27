@@ -3924,3 +3924,96 @@ fn test_checkin_rate_limit_admin_only() {
     client.set_min_checkin_cooldown(&600u64);
     assert_eq!(client.get_min_checkin_cooldown(), 600u64);
 }
+
+// ============================================================
+// Issue: Accelerated TTL Decay — tests
+// ============================================================
+
+#[test]
+fn test_accelerate_ttl_decay_moves_expiry_forward() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+
+    let ttl_before = client.get_ttl_remaining(&vault_id).unwrap();
+    client.accelerate_ttl_decay(&vault_id, &owner, &1_000u64).unwrap();
+    let ttl_after = client.get_ttl_remaining(&vault_id).unwrap();
+
+    assert!(ttl_after < ttl_before);
+    assert_eq!(ttl_before - ttl_after, 1_000u64);
+}
+
+#[test]
+fn test_accelerate_ttl_decay_emits_event() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+
+    client.accelerate_ttl_decay(&vault_id, &owner, &500u64).unwrap();
+    assert!(find_event_by_topic(&env, types::TTL_ACCELERATE_TOPIC));
+}
+
+#[test]
+fn test_accelerate_ttl_decay_fails_for_non_owner() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let attacker = Address::generate(&env);
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+
+    assert!(client.try_accelerate_ttl_decay(&vault_id, &attacker, &500u64).is_err());
+}
+
+#[test]
+fn test_accelerate_ttl_decay_fails_with_zero_seconds() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+
+    assert!(client.try_accelerate_ttl_decay(&vault_id, &owner, &0u64).is_err());
+}
+
+#[test]
+fn test_accelerate_ttl_decay_fails_when_would_expire_immediately() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    // interval = 500s → remaining TTL = 500s; accelerating by 500 would leave 0
+    let vault_id = client.create_vault(&owner, &beneficiary, &500u64, &None);
+
+    assert!(client.try_accelerate_ttl_decay(&vault_id, &owner, &500u64).is_err());
+}
+
+#[test]
+fn test_accelerate_ttl_decay_fails_on_released_vault() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &100u64, &None);
+    client.deposit(&vault_id, &owner, &500i128);
+    env.ledger().with_mut(|l| l.timestamp += 200);
+    client.trigger_release(&vault_id);
+
+    assert!(client.try_accelerate_ttl_decay(&vault_id, &owner, &10u64).is_err());
+}
+
+#[test]
+fn test_accelerate_ttl_decay_vault_can_be_released_after_acceleration() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+    client.deposit(&vault_id, &owner, &500i128);
+
+    // Accelerate by 9_999s so only 1s of TTL remains
+    client.accelerate_ttl_decay(&vault_id, &owner, &9_999u64).unwrap();
+
+    // Advance 1 second to expire
+    env.ledger().with_mut(|l| l.timestamp += 1);
+    assert!(client.is_expired(&vault_id));
+
+    client.trigger_release(&vault_id);
+    assert_eq!(client.get_release_status(&vault_id), ReleaseStatus::Released);
+}
+
+#[test]
+fn test_accelerate_ttl_decay_multiple_calls_accumulate() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let vault_id = client.create_vault(&owner, &beneficiary, &10_000u64, &None);
+
+    let ttl_start = client.get_ttl_remaining(&vault_id).unwrap();
+    client.accelerate_ttl_decay(&vault_id, &owner, &1_000u64).unwrap();
+    client.accelerate_ttl_decay(&vault_id, &owner, &2_000u64).unwrap();
+    let ttl_end = client.get_ttl_remaining(&vault_id).unwrap();
+
+    assert_eq!(ttl_start - ttl_end, 3_000u64);
+}
