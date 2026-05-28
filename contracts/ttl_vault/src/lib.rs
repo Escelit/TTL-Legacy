@@ -41,6 +41,8 @@ use types::{
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
     HibernationEntry,
     HIBERNATION_ENTERED_TOPIC, HIBERNATION_EXITED_TOPIC,
+    EncryptedBackupCodes, PasskeyAnalytics, PasskeyUsageStat,
+    BACKUP_CODES_ENCRYPTED_TOPIC, PASSKEY_ANALYTICS_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;

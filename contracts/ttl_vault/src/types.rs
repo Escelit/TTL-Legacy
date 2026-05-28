@@ -233,6 +233,8 @@ pub enum DataKey {
     ReleaseVoteThreshold(u64),
     // Hibernation: temporary suspension of check-in requirement
     Hibernation(u64),
+    // Issue #553: encrypted backup codes
+    EncryptedBackupCodes(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
