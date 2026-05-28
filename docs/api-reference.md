@@ -69,7 +69,89 @@ Clones a vault configuration into a new vault with selective parameter overrides
 
 ---
 
-## Backend API
+## Vault State Snapshots (Disaster Recovery)
+
+### `create_snapshot`
+
+```rust
+create_snapshot(vault_id: u64, caller: Address) -> u32
+```
+
+Creates a point-in-time snapshot of the vault's mutable state. Only the vault owner may call this. Up to 10 snapshots are retained per vault; once the limit is reached, the oldest slot is overwritten (slots cycle 1–10).
+
+**Captured fields:** `balance`, `beneficiary`, `check_in_interval`, `last_check_in`, `metadata`, `is_paused`, `taken_at`.
+
+**Returns** the snapshot ID (1–10).
+
+**Errors**
+
+| Error     | Code | Condition                    |
+|-----------|------|------------------------------|
+| `NotOwner`| 6    | Caller is not the vault owner|
+| `Paused`  | 10   | Contract is globally paused  |
+
+**Event emitted:** `snap_crt` — `(snapshot_id, taken_at)`
+
+---
+
+### `restore_from_snapshot`
+
+```rust
+restore_from_snapshot(vault_id: u64, caller: Address, snapshot_id: u32)
+```
+
+Restores the vault to a previously saved snapshot. Only the vault owner may call this. The vault must be in `Locked` status.
+
+**Restored fields:** `balance`, `beneficiary`, `check_in_interval`, `last_check_in`, `metadata`, `is_paused`.
+
+**Errors**
+
+| Error            | Code | Condition                              |
+|------------------|------|----------------------------------------|
+| `NotOwner`       | 6    | Caller is not the vault owner          |
+| `AlreadyReleased`| 7    | Vault is Released or Cancelled         |
+| `VaultNotFound`  | 3    | `snapshot_id` does not exist           |
+| `Paused`         | 10   | Contract is globally paused            |
+
+**Event emitted:** `snap_rst` — `(snapshot_id, taken_at)`
+
+---
+
+### `get_snapshot`
+
+```rust
+get_snapshot(vault_id: u64, snapshot_id: u32) -> Option<VaultSnapshot>
+```
+
+Returns the snapshot data for the given slot, or `None` if it does not exist.
+
+---
+
+### `get_snapshot_count`
+
+```rust
+get_snapshot_count(vault_id: u64) -> u32
+```
+
+Returns the total number of snapshots ever taken for the vault (not capped at 10). Use `count % 10 + 1` to find the next slot that will be written.
+
+---
+
+### `VaultSnapshot` type
+
+```rust
+pub struct VaultSnapshot {
+    pub snapshot_id: u32,
+    pub vault_id: u64,
+    pub taken_at: u64,
+    pub balance: i128,
+    pub beneficiary: Address,
+    pub check_in_interval: u64,
+    pub last_check_in: u64,
+    pub metadata: String,
+    pub is_paused: bool,
+}
+```
 
 Base URL: `http://localhost:3000`
 

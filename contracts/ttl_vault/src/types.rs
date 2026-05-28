@@ -96,6 +96,10 @@ pub const BATCH_STATUS_TOPIC: Symbol = symbol_short!("bat_stat");
 pub const TTL_BORROW_TOPIC: Symbol = symbol_short!("ttl_bor");
 pub const TTL_REPAY_TOPIC: Symbol = symbol_short!("ttl_rep");
 
+// Vault state snapshots
+pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
+pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
+
 // Issue: Check-in Rate Limiting
 pub const CHECKIN_RATE_LIMITED_TOPIC: Symbol = symbol_short!("ci_rl");
 
@@ -181,6 +185,9 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // Vault state snapshots
+    VaultSnapshot(u64, u32),
+    VaultSnapshotCount(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -537,4 +544,19 @@ pub struct TtlPool {
 pub struct BiometricEntry {
     pub credential_hash: BytesN<32>,
     pub added_at: u64,
+}
+
+/// A point-in-time snapshot of vault state for disaster recovery.
+#[contracttype]
+#[derive(Clone)]
+pub struct VaultSnapshot {
+    pub snapshot_id: u32,
+    pub vault_id: u64,
+    pub taken_at: u64,
+    pub balance: i128,
+    pub beneficiary: Address,
+    pub check_in_interval: u64,
+    pub last_check_in: u64,
+    pub metadata: String,
+    pub is_paused: bool,
 }

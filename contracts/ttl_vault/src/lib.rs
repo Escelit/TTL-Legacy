@@ -38,8 +38,8 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
+    VaultSnapshot, SNAPSHOT_CREATED_TOPIC, SNAPSHOT_RESTORED_TOPIC,
 };
-
 #[cfg(test)]
 mod regression_tests;
 
@@ -5962,5 +5962,133 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    // ── Vault State Snapshots (Disaster Recovery) ────────────────────────────
+
+    /// Creates a snapshot of the current vault state for disaster recovery.
+    ///
+    /// Only the vault owner may call this. Snapshots capture the essential
+    /// mutable fields (balance, beneficiary, interval, last_check_in, metadata,
+    /// is_paused) at the current ledger timestamp. Up to 10 snapshots are kept
+    /// per vault; the oldest is overwritten when the limit is reached.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault to snapshot
+    /// * `caller`   - Must be the vault owner (requires auth)
+    ///
+    /// # Returns
+    /// The snapshot ID (1-based, wraps at 10)
+    pub fn create_snapshot(env: Env, vault_id: u64, caller: Address) -> u32 {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            panic_with_error!(&env, ContractError::NotOwner);
+        }
+
+        let count_key = DataKey::VaultSnapshotCount(vault_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        // Cycle through slots 0..9 (max 10 snapshots)
+        let slot = count % 10;
+        let snapshot_id = slot + 1;
+
+        let snap = VaultSnapshot {
+            snapshot_id,
+            vault_id,
+            taken_at: env.ledger().timestamp(),
+            balance: vault.balance,
+            beneficiary: vault.beneficiary.clone(),
+            check_in_interval: vault.check_in_interval,
+            last_check_in: vault.last_check_in,
+            metadata: vault.metadata.clone(),
+            is_paused: vault.is_paused,
+        };
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        let snap_key = DataKey::VaultSnapshot(vault_id, snapshot_id);
+        env.storage().persistent().set(&snap_key, &snap);
+        env.storage().persistent().extend_ttl(&snap_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().persistent().set(&count_key, &(count + 1));
+        env.storage().persistent().extend_ttl(&count_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (SNAPSHOT_CREATED_TOPIC, vault_id),
+            (snapshot_id, env.ledger().timestamp()),
+        );
+        snapshot_id
+    }
+
+    /// Restores a vault to a previously saved snapshot.
+    ///
+    /// Only the vault owner may call this. The vault must not be in a Released
+    /// or Cancelled state. Restores: balance, beneficiary, check_in_interval,
+    /// last_check_in, metadata, and is_paused from the snapshot.
+    ///
+    /// # Arguments
+    /// * `vault_id`    - The vault to restore
+    /// * `caller`      - Must be the vault owner (requires auth)
+    /// * `snapshot_id` - The snapshot to restore from (1-based)
+    pub fn restore_from_snapshot(env: Env, vault_id: u64, caller: Address, snapshot_id: u32) {
+        caller.require_auth();
+        Self::require_not_paused(&env);
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            panic_with_error!(&env, ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            panic_with_error!(&env, ContractError::AlreadyReleased);
+        }
+
+        let snap_key = DataKey::VaultSnapshot(vault_id, snapshot_id);
+        let snap: VaultSnapshot = env
+            .storage()
+            .persistent()
+            .get(&snap_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::VaultNotFound));
+
+        vault.balance = snap.balance;
+        vault.beneficiary = snap.beneficiary.clone();
+        vault.check_in_interval = snap.check_in_interval;
+        vault.last_check_in = snap.last_check_in;
+        vault.metadata = snap.metadata.clone();
+        vault.is_paused = snap.is_paused;
+
+        let vault_key = DataKey::Vault(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&vault_key, &vault);
+        env.storage().persistent().extend_ttl(&vault_key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (SNAPSHOT_RESTORED_TOPIC, vault_id),
+            (snapshot_id, snap.taken_at),
+        );
+    }
+
+    /// Returns a specific snapshot for a vault.
+    ///
+    /// # Arguments
+    /// * `vault_id`    - The vault ID
+    /// * `snapshot_id` - The snapshot ID (1-based)
+    ///
+    /// # Returns
+    /// `Some(VaultSnapshot)` if found, `None` otherwise
+    pub fn get_snapshot(env: Env, vault_id: u64, snapshot_id: u32) -> Option<VaultSnapshot> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VaultSnapshot(vault_id, snapshot_id))
+    }
+
+    /// Returns the total number of snapshots ever taken for a vault.
+    ///
+    /// The active snapshot IDs cycle through 1..=10. Use this count to
+    /// determine which slots are populated.
+    pub fn get_snapshot_count(env: Env, vault_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VaultSnapshotCount(vault_id))
+            .unwrap_or(0)
     }
 }
