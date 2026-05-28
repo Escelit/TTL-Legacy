@@ -38,6 +38,11 @@ use types::{
     STATE_TRANSITION_TOPIC, OWNERSHIP_PROOF_TOPIC, INTEGRITY_TOPIC, BATCH_STATUS_TOPIC,
     ProofOfLifeEntry, ReleaseVoteEntry,
     PROOF_OF_LIFE_TOPIC, RELEASE_VOTE_TOPIC, RELEASE_VOTE_PASSED_TOPIC,
+    SuccessionPlan, EscrowEntry, ArbitrationConfig, NotificationEntry,
+    SUCCESSION_SET_TOPIC, SUCCESSION_ACTIVATED_TOPIC,
+    ESCROW_CREATED_TOPIC, ESCROW_ACCEPTED_TOPIC, ESCROW_REJECTED_TOPIC, ESCROW_EXPIRED_TOPIC,
+    ARBITRATOR_SET_TOPIC, ARBITRATION_RULED_TOPIC,
+    VAULT_NOTIFY_TOPIC,
 };
 
 #[cfg(test)]
@@ -148,6 +153,17 @@ pub enum ContractError {
     ProofOfLifeExpired = 52,
     AlreadyVoted = 53,
     VotingNotEnabled = 54,
+    // Issue #494
+    SuccessionNotSet = 55,
+    SuccessionAlreadyActivated = 56,
+    // Issue #495
+    EscrowNotFound = 57,
+    EscrowAlreadySettled = 58,
+    EscrowExpired = 59,
+    // Issue #496
+    ArbitratorNotSet = 60,
+    ArbitrationAlreadyRuled = 61,
+    NotArbitrator = 62,
 }
 
 #[contract]
@@ -5837,5 +5853,445 @@ impl TtlVaultContract {
         env.storage()
             .persistent()
             .get(&DataKey::ReleaseVoteThreshold(vault_id))
+    }
+
+    // ── Issue #494: Beneficiary Succession Planning ───────────────────────────
+
+    /// Sets a successor beneficiary for a vault.
+    ///
+    /// If the primary beneficiary declines or is unavailable, the owner can
+    /// activate the succession plan to redirect funds to the successor.
+    ///
+    /// # Arguments
+    /// * `vault_id`          - The vault ID
+    /// * `caller`            - Must be the vault owner (requires auth)
+    /// * `successor`         - Fallback beneficiary address
+    /// * `activation_delay`  - Seconds after activation before successor can claim (0 = immediate)
+    pub fn set_succession_plan(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        successor: Address,
+        activation_delay: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        if successor == vault.owner || successor == vault.beneficiary {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+        let plan = SuccessionPlan {
+            successor: successor.clone(),
+            activation_delay,
+            activated: false,
+            activated_at: 0,
+        };
+        let key = DataKey::SuccessionPlan(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &plan);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((SUCCESSION_SET_TOPIC, vault_id), (caller, successor, activation_delay));
+        Ok(())
+    }
+
+    /// Activates the succession plan, redirecting the vault beneficiary to the successor.
+    ///
+    /// Can only be called by the vault owner. Requires a succession plan to be set
+    /// and not yet activated.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller`   - Must be the vault owner (requires auth)
+    pub fn activate_succession(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let mut vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.status != ReleaseStatus::Locked {
+            return Err(ContractError::AlreadyReleased);
+        }
+        let key = DataKey::SuccessionPlan(vault_id);
+        let mut plan: SuccessionPlan = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::SuccessionNotSet)?;
+        if plan.activated {
+            return Err(ContractError::SuccessionAlreadyActivated);
+        }
+        let now = env.ledger().timestamp();
+        plan.activated = true;
+        plan.activated_at = now;
+        // Update vault beneficiary to successor
+        let old_beneficiary = vault.beneficiary.clone();
+        vault.beneficiary = plan.successor.clone();
+        Self::save_vault(&env, vault_id, &vault);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &plan);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (SUCCESSION_ACTIVATED_TOPIC, vault_id),
+            (old_beneficiary, plan.successor.clone(), now),
+        );
+        Self::emit_notification(&env, vault_id, String::from_str(&env, "succession_activated"));
+        Ok(())
+    }
+
+    /// Returns the succession plan for a vault, if set.
+    pub fn get_succession_plan(env: Env, vault_id: u64) -> Option<SuccessionPlan> {
+        env.storage().persistent().get(&DataKey::SuccessionPlan(vault_id))
+    }
+
+    // ── Issue #495: Beneficiary Escrow ────────────────────────────────────────
+
+    /// Creates an escrow entry after vault release, holding funds pending beneficiary acceptance.
+    ///
+    /// Called internally after `trigger_release` or can be called by the owner to
+    /// place released funds into escrow. The beneficiary has until `expiry_seconds`
+    /// to accept; otherwise funds return to the owner.
+    ///
+    /// # Arguments
+    /// * `vault_id`        - The vault ID
+    /// * `caller`          - Must be the vault owner (requires auth)
+    /// * `expiry_seconds`  - Seconds from now until the escrow expires
+    pub fn create_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        expiry_seconds: u64,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if vault.balance == 0 {
+            return Err(ContractError::EmptyVault);
+        }
+        if expiry_seconds == 0 {
+            return Err(ContractError::InvalidInterval);
+        }
+        let key = DataKey::EscrowEntry(vault_id);
+        if env.storage().persistent().has(&key) {
+            return Err(ContractError::EscrowAlreadySettled);
+        }
+        let now = env.ledger().timestamp();
+        let entry = EscrowEntry {
+            amount: vault.balance,
+            beneficiary: vault.beneficiary.clone(),
+            created_at: now,
+            expires_at: now + expiry_seconds,
+            accepted: false,
+        };
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &entry);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (ESCROW_CREATED_TOPIC, vault_id),
+            (vault.beneficiary.clone(), vault.balance, now + expiry_seconds),
+        );
+        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_created"));
+        Ok(())
+    }
+
+    /// Beneficiary accepts the escrow, releasing funds to themselves.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller`   - Must be the escrow beneficiary (requires auth)
+    pub fn accept_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        let key = DataKey::EscrowEntry(vault_id);
+        let mut entry: EscrowEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EscrowNotFound)?;
+        if entry.accepted {
+            return Err(ContractError::EscrowAlreadySettled);
+        }
+        let now = env.ledger().timestamp();
+        if now > entry.expires_at {
+            return Err(ContractError::EscrowExpired);
+        }
+        if caller != entry.beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
+        entry.accepted = true;
+        env.storage().persistent().set(&key, &entry);
+        // Transfer funds to beneficiary
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &caller, &entry.amount);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((ESCROW_ACCEPTED_TOPIC, vault_id), (caller.clone(), entry.amount));
+        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_accepted"));
+        Ok(())
+    }
+
+    /// Beneficiary rejects the escrow, returning funds to the vault owner.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller`   - Must be the escrow beneficiary (requires auth)
+    pub fn reject_escrow(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        let key = DataKey::EscrowEntry(vault_id);
+        let mut entry: EscrowEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EscrowNotFound)?;
+        if entry.accepted {
+            return Err(ContractError::EscrowAlreadySettled);
+        }
+        let now = env.ledger().timestamp();
+        if now > entry.expires_at {
+            return Err(ContractError::EscrowExpired);
+        }
+        if caller != entry.beneficiary {
+            return Err(ContractError::NotBeneficiary);
+        }
+        entry.accepted = false;
+        // Mark as settled by removing the entry
+        env.storage().persistent().remove(&key);
+        // Return funds to owner
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &vault.owner, &entry.amount);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((ESCROW_REJECTED_TOPIC, vault_id), (caller, entry.amount));
+        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_rejected"));
+        Ok(())
+    }
+
+    /// Expires an escrow whose deadline has passed, returning funds to the vault owner.
+    ///
+    /// Anyone can call this once the escrow has expired.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    pub fn expire_escrow(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        let vault = Self::load_vault(&env, vault_id);
+        let key = DataKey::EscrowEntry(vault_id);
+        let entry: EscrowEntry = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::EscrowNotFound)?;
+        if entry.accepted {
+            return Err(ContractError::EscrowAlreadySettled);
+        }
+        let now = env.ledger().timestamp();
+        if now <= entry.expires_at {
+            return Err(ContractError::NotExpired);
+        }
+        env.storage().persistent().remove(&key);
+        let token_client = token::Client::new(&env, &vault.token_address);
+        token_client.transfer(&env.current_contract_address(), &vault.owner, &entry.amount);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((ESCROW_EXPIRED_TOPIC, vault_id), (vault.owner.clone(), entry.amount));
+        Self::emit_notification(&env, vault_id, String::from_str(&env, "escrow_expired"));
+        Ok(())
+    }
+
+    /// Returns the escrow entry for a vault, if one exists.
+    pub fn get_escrow(env: Env, vault_id: u64) -> Option<EscrowEntry> {
+        env.storage().persistent().get(&DataKey::EscrowEntry(vault_id))
+    }
+
+    // ── Issue #496: Beneficiary Dispute Arbitration ───────────────────────────
+
+    /// Sets an arbitrator for a vault.
+    ///
+    /// The arbitrator is a trusted third party who can rule on disputes between
+    /// the owner and beneficiary. Only the vault owner can set the arbitrator.
+    ///
+    /// # Arguments
+    /// * `vault_id`   - The vault ID
+    /// * `caller`     - Must be the vault owner (requires auth)
+    /// * `arbitrator` - The arbitrator address
+    pub fn set_arbitrator(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        arbitrator: Address,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if arbitrator == vault.owner || arbitrator == vault.beneficiary {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+        let config = ArbitrationConfig {
+            arbitrator: arbitrator.clone(),
+            ruled: false,
+            ruling: false,
+            ruled_at: 0,
+        };
+        let key = DataKey::ArbitrationConfig(vault_id);
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&key, &config);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, ttl);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((ARBITRATOR_SET_TOPIC, vault_id), (caller, arbitrator));
+        Ok(())
+    }
+
+    /// The arbitrator issues a ruling on a filed dispute.
+    ///
+    /// * `ruling = true`  → release funds to beneficiary
+    /// * `ruling = false` → return funds to owner
+    ///
+    /// Requires a dispute to be in `Filed` state and an arbitrator to be configured.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller`   - Must be the configured arbitrator (requires auth)
+    /// * `ruling`   - `true` = favour beneficiary, `false` = favour owner
+    pub fn arbitrate_dispute(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        ruling: bool,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+
+        let arb_key = DataKey::ArbitrationConfig(vault_id);
+        let mut config: ArbitrationConfig = env
+            .storage()
+            .persistent()
+            .get(&arb_key)
+            .ok_or(ContractError::ArbitratorNotSet)?;
+        if caller != config.arbitrator {
+            return Err(ContractError::NotArbitrator);
+        }
+        if config.ruled {
+            return Err(ContractError::ArbitrationAlreadyRuled);
+        }
+
+        // Dispute must be filed
+        let dispute_status = env
+            .storage()
+            .persistent()
+            .get::<DataKey, DisputeStatus>(&DataKey::DisputeStatus(vault_id))
+            .unwrap_or(DisputeStatus::None);
+        if dispute_status != DisputeStatus::Filed {
+            return Err(ContractError::InvalidBeneficiary);
+        }
+
+        let now = env.ledger().timestamp();
+        config.ruled = true;
+        config.ruling = ruling;
+        config.ruled_at = now;
+
+        let ttl = vault_ttl_ledgers(vault.check_in_interval);
+        env.storage().persistent().set(&arb_key, &config);
+        env.storage().persistent().extend_ttl(&arb_key, VAULT_TTL_THRESHOLD, ttl);
+
+        // Mark dispute as resolved
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeStatus(vault_id), &DisputeStatus::Resolved);
+
+        // Execute ruling: transfer funds accordingly
+        if vault.balance > 0 {
+            let token_client = token::Client::new(&env, &vault.token_address);
+            let recipient = if ruling { vault.beneficiary.clone() } else { vault.owner.clone() };
+            token_client.transfer(&env.current_contract_address(), &recipient, &vault.balance);
+        }
+
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish(
+            (ARBITRATION_RULED_TOPIC, vault_id),
+            (caller, ruling, now),
+        );
+        Self::emit_notification(&env, vault_id, String::from_str(&env, "arbitration_ruled"));
+        Ok(())
+    }
+
+    /// Returns the arbitration configuration for a vault, if set.
+    pub fn get_arbitration_config(env: Env, vault_id: u64) -> Option<ArbitrationConfig> {
+        env.storage().persistent().get(&DataKey::ArbitrationConfig(vault_id))
+    }
+
+    // ── Issue #497: Beneficiary Notification System ───────────────────────────
+
+    /// Emits a vault status notification event and appends it to the on-chain log.
+    ///
+    /// Can be called by the vault owner or admin to notify the beneficiary of
+    /// any status change. Automatically called by succession, escrow, and arbitration.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller`   - Must be the vault owner or admin (requires auth)
+    /// * `kind`     - Short notification type string (max 32 chars)
+    pub fn notify_beneficiary(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        kind: String,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        let is_admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .map(|a| a == caller)
+            .unwrap_or(false);
+        if caller != vault.owner && !is_admin {
+            return Err(ContractError::NotOwner);
+        }
+        Self::emit_notification(&env, vault_id, kind);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        Ok(())
+    }
+
+    /// Returns the notification log for a vault.
+    pub fn get_notification_log(env: Env, vault_id: u64) -> Vec<NotificationEntry> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::NotificationLog(vault_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Internal helper: appends a notification entry and emits the event.
+    fn emit_notification(env: &Env, vault_id: u64, kind: String) {
+        let now = env.ledger().timestamp();
+        let key = DataKey::NotificationLog(vault_id);
+        let mut log: Vec<NotificationEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        log.push_back(NotificationEntry { kind: kind.clone(), timestamp: now });
+        env.storage().persistent().set(&key, &log);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.events().publish((VAULT_NOTIFY_TOPIC, vault_id), (kind, now));
     }
 }

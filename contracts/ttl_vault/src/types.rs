@@ -104,6 +104,23 @@ pub const TTL_ACCELERATE_TOPIC: Symbol = symbol_short!("ttl_acc");
 // Issue: Geographic Check-in Tracking
 pub const CHECKIN_GEO_TOPIC: Symbol = symbol_short!("ci_geo");
 
+// Issue #494: Beneficiary Succession Planning
+pub const SUCCESSION_SET_TOPIC: Symbol = symbol_short!("suc_set");
+pub const SUCCESSION_ACTIVATED_TOPIC: Symbol = symbol_short!("suc_act");
+
+// Issue #495: Beneficiary Escrow
+pub const ESCROW_CREATED_TOPIC: Symbol = symbol_short!("esc_cre");
+pub const ESCROW_ACCEPTED_TOPIC: Symbol = symbol_short!("esc_acc");
+pub const ESCROW_REJECTED_TOPIC: Symbol = symbol_short!("esc_rej");
+pub const ESCROW_EXPIRED_TOPIC: Symbol = symbol_short!("esc_exp");
+
+// Issue #496: Dispute Arbitration
+pub const ARBITRATOR_SET_TOPIC: Symbol = symbol_short!("arb_set");
+pub const ARBITRATION_RULED_TOPIC: Symbol = symbol_short!("arb_rul");
+
+// Issue #497: Beneficiary Notification
+pub const VAULT_NOTIFY_TOPIC: Symbol = symbol_short!("v_notif");
+
 /// Warning threshold in seconds. If TTL remaining < this value, ping_expiry emits an event.
 pub const EXPIRY_WARNING_THRESHOLD: u64 = 86_400; // 24 hours
 
@@ -180,6 +197,14 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    // Issue #494: beneficiary succession
+    SuccessionPlan(u64),
+    // Issue #495: beneficiary escrow
+    EscrowEntry(u64),
+    // Issue #496: dispute arbitration
+    ArbitrationConfig(u64),
+    // Issue #497: notification log
+    NotificationLog(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -536,4 +561,62 @@ pub struct TtlPool {
 pub struct BiometricEntry {
     pub credential_hash: BytesN<32>,
     pub added_at: u64,
+}
+
+/// Succession plan: if the primary beneficiary is unavailable, funds go to the successor.
+/// Issue #494
+#[contracttype]
+#[derive(Clone)]
+pub struct SuccessionPlan {
+    /// Fallback beneficiary address.
+    pub successor: Address,
+    /// Unix timestamp after which the successor can claim (0 = immediately on activation).
+    pub activation_delay: u64,
+    /// Whether the succession has been activated.
+    pub activated: bool,
+    /// When the succession was activated (0 if not yet).
+    pub activated_at: u64,
+}
+
+/// Escrow entry: released funds are held pending beneficiary acceptance.
+/// Issue #495
+#[contracttype]
+#[derive(Clone)]
+pub struct EscrowEntry {
+    /// Amount held in escrow.
+    pub amount: i128,
+    /// Beneficiary who must accept.
+    pub beneficiary: Address,
+    /// Unix timestamp when the escrow was created.
+    pub created_at: u64,
+    /// Unix timestamp after which the escrow expires and funds return to owner.
+    pub expires_at: u64,
+    /// Whether the beneficiary has accepted.
+    pub accepted: bool,
+}
+
+/// Arbitration configuration for a vault.
+/// Issue #496
+#[contracttype]
+#[derive(Clone)]
+pub struct ArbitrationConfig {
+    /// Designated arbitrator address.
+    pub arbitrator: Address,
+    /// Whether an arbitration ruling has been issued.
+    pub ruled: bool,
+    /// Ruling: true = release to beneficiary, false = return to owner.
+    pub ruling: bool,
+    /// Timestamp of the ruling (0 if not yet ruled).
+    pub ruled_at: u64,
+}
+
+/// A single on-chain notification entry for a vault.
+/// Issue #497
+#[contracttype]
+#[derive(Clone)]
+pub struct NotificationEntry {
+    /// Short notification type tag (e.g. "released", "expired", "disputed").
+    pub kind: String,
+    /// Unix timestamp when the notification was emitted.
+    pub timestamp: u64,
 }

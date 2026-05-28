@@ -4082,3 +4082,331 @@ fn test_get_release_votes_empty_by_default() {
     let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
     assert_eq!(client.get_release_votes(&id).len(), 0);
 }
+
+// ── Issue #494: Beneficiary Succession Planning ───────────────────────────────
+
+#[test]
+fn test_set_and_get_succession_plan() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let successor = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
+    let plan = client.get_succession_plan(&id).unwrap();
+    assert_eq!(plan.successor, successor);
+    assert!(!plan.activated);
+}
+
+#[test]
+fn test_set_succession_plan_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let successor = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_set_succession_plan(&id, &stranger, &successor, &0u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_set_succession_plan_owner_as_successor_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_set_succession_plan(&id, &owner, &owner, &0u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(17)); // InvalidBeneficiary
+}
+
+#[test]
+fn test_activate_succession_updates_beneficiary() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let successor = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
+    client.activate_succession(&id, &owner).unwrap();
+
+    let plan = client.get_succession_plan(&id).unwrap();
+    assert!(plan.activated);
+    // Vault beneficiary should now be the successor
+    let vault = client.get_vault(&id);
+    assert_eq!(vault.beneficiary, successor);
+}
+
+#[test]
+fn test_activate_succession_twice_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let successor = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
+    client.activate_succession(&id, &owner).unwrap();
+    let err = client.try_activate_succession(&id, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(56)); // SuccessionAlreadyActivated
+}
+
+#[test]
+fn test_activate_succession_no_plan_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_activate_succession(&id, &owner).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(55)); // SuccessionNotSet
+}
+
+// ── Issue #495: Beneficiary Escrow ────────────────────────────────────────────
+
+#[test]
+fn test_create_and_get_escrow() {
+    let (_, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+
+    client.create_escrow(&id, &owner, &3600u64).unwrap();
+    let escrow = client.get_escrow(&id).unwrap();
+    assert_eq!(escrow.amount, 1000);
+    assert_eq!(escrow.beneficiary, beneficiary);
+    assert!(!escrow.accepted);
+}
+
+#[test]
+fn test_create_escrow_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+
+    let err = client.try_create_escrow(&id, &stranger, &3600u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_create_escrow_empty_vault_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_create_escrow(&id, &owner, &3600u64).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(4)); // EmptyVault
+}
+
+#[test]
+fn test_accept_escrow_transfers_funds() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.create_escrow(&id, &owner, &3600u64).unwrap();
+
+    let before = token::Client::new(&env, &token_address).balance(&beneficiary);
+    client.accept_escrow(&id, &beneficiary).unwrap();
+    let after = token::Client::new(&env, &token_address).balance(&beneficiary);
+    assert_eq!(after - before, 1000);
+    assert!(client.get_escrow(&id).unwrap().accepted);
+}
+
+#[test]
+fn test_accept_escrow_non_beneficiary_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.create_escrow(&id, &owner, &3600u64).unwrap();
+
+    let err = client.try_accept_escrow(&id, &stranger).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(30)); // NotBeneficiary
+}
+
+#[test]
+fn test_reject_escrow_returns_funds_to_owner() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.create_escrow(&id, &owner, &3600u64).unwrap();
+
+    let before = token::Client::new(&env, &token_address).balance(&owner);
+    client.reject_escrow(&id, &beneficiary).unwrap();
+    let after = token::Client::new(&env, &token_address).balance(&owner);
+    assert_eq!(after - before, 1000);
+    assert!(client.get_escrow(&id).is_none());
+}
+
+#[test]
+fn test_expire_escrow_returns_funds_to_owner() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.create_escrow(&id, &owner, &3600u64).unwrap();
+
+    // Advance time past expiry
+    env.ledger().with_mut(|l| l.timestamp += 3601);
+
+    let before = token::Client::new(&env, &token_address).balance(&owner);
+    client.expire_escrow(&id).unwrap();
+    let after = token::Client::new(&env, &token_address).balance(&owner);
+    assert_eq!(after - before, 1000);
+}
+
+#[test]
+fn test_expire_escrow_before_expiry_fails() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.create_escrow(&id, &owner, &3600u64).unwrap();
+
+    let err = client.try_expire_escrow(&id).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(16)); // NotExpired
+}
+
+// ── Issue #496: Beneficiary Dispute Arbitration ───────────────────────────────
+
+#[test]
+fn test_set_and_get_arbitration_config() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let arbitrator = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
+    let config = client.get_arbitration_config(&id).unwrap();
+    assert_eq!(config.arbitrator, arbitrator);
+    assert!(!config.ruled);
+}
+
+#[test]
+fn test_set_arbitrator_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let arbitrator = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_set_arbitrator(&id, &stranger, &arbitrator).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_arbitrate_dispute_rules_for_beneficiary() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let arbitrator = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
+    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "dispute reason")).unwrap();
+
+    let before = token::Client::new(&env, &token_address).balance(&beneficiary);
+    client.arbitrate_dispute(&id, &arbitrator, &true).unwrap();
+    let after = token::Client::new(&env, &token_address).balance(&beneficiary);
+    assert_eq!(after - before, 1000);
+
+    let config = client.get_arbitration_config(&id).unwrap();
+    assert!(config.ruled);
+    assert!(config.ruling);
+}
+
+#[test]
+fn test_arbitrate_dispute_rules_for_owner() {
+    let (env, owner, beneficiary, _, token_address, client) = setup();
+    let arbitrator = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
+    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "dispute reason")).unwrap();
+
+    let before = token::Client::new(&env, &token_address).balance(&owner);
+    client.arbitrate_dispute(&id, &arbitrator, &false).unwrap();
+    let after = token::Client::new(&env, &token_address).balance(&owner);
+    assert_eq!(after - before, 1000);
+}
+
+#[test]
+fn test_arbitrate_dispute_non_arbitrator_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let arbitrator = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
+    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "reason")).unwrap();
+
+    let err = client.try_arbitrate_dispute(&id, &stranger, &true).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(62)); // NotArbitrator
+}
+
+#[test]
+fn test_arbitrate_dispute_no_arbitrator_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "reason")).unwrap();
+
+    let err = client.try_arbitrate_dispute(&id, &owner, &true).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(60)); // ArbitratorNotSet
+}
+
+#[test]
+fn test_arbitrate_dispute_double_ruling_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let arbitrator = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+    client.set_arbitrator(&id, &owner, &arbitrator).unwrap();
+    client.file_dispute(&id, &soroban_sdk::String::from_str(&env, "reason")).unwrap();
+    client.arbitrate_dispute(&id, &arbitrator, &true).unwrap();
+
+    let err = client.try_arbitrate_dispute(&id, &arbitrator, &false).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(61)); // ArbitrationAlreadyRuled
+}
+
+// ── Issue #497: Beneficiary Notification System ───────────────────────────────
+
+#[test]
+fn test_notify_beneficiary_appends_log() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.notify_beneficiary(&id, &owner, &soroban_sdk::String::from_str(&env, "released")).unwrap();
+    let log = client.get_notification_log(&id);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.get(0).unwrap().kind, soroban_sdk::String::from_str(&env, "released"));
+}
+
+#[test]
+fn test_notify_beneficiary_non_owner_fails() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let stranger = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    let err = client.try_notify_beneficiary(&id, &stranger, &soroban_sdk::String::from_str(&env, "test")).unwrap_err().unwrap();
+    assert_eq!(err, soroban_sdk::Error::from_contract_error(6)); // NotOwner
+}
+
+#[test]
+fn test_notification_log_empty_by_default() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    assert_eq!(client.get_notification_log(&id).len(), 0);
+}
+
+#[test]
+fn test_succession_activation_emits_notification() {
+    let (env, owner, beneficiary, _, _, client) = setup();
+    let successor = Address::generate(&env);
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+
+    client.set_succession_plan(&id, &owner, &successor, &0u64).unwrap();
+    client.activate_succession(&id, &owner).unwrap();
+
+    // Succession activation should have appended a notification
+    let log = client.get_notification_log(&id);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log.get(0).unwrap().kind, soroban_sdk::String::from_str(&env, "succession_activated"));
+}
+
+#[test]
+fn test_escrow_events_emit_notifications() {
+    let (_, owner, beneficiary, _, _, client) = setup();
+    let id = client.create_vault(&owner, &beneficiary, &3600u64, &None);
+    client.deposit(&id, &owner, &1000i128);
+
+    client.create_escrow(&id, &owner, &3600u64).unwrap();
+    assert_eq!(client.get_notification_log(&id).len(), 1); // escrow_created
+
+    client.accept_escrow(&id, &beneficiary).unwrap();
+    assert_eq!(client.get_notification_log(&id).len(), 2); // escrow_accepted
+}
