@@ -183,6 +183,29 @@ pub const VESTING_CATCHUP_CLAIMED_TOPIC: Symbol = symbol_short!("vest_cuc");
 pub const VESTING_BONUS_SET_TOPIC: Symbol = symbol_short!("vest_bon");
 pub const VESTING_BONUS_CLAIMED_TOPIC: Symbol = symbol_short!("vest_bonc");
 
+// Issue #581: Token Conversion
+pub const TOKEN_CONVERSION_TOPIC: Symbol = symbol_short!("tok_conv");
+// Issue #582: Token Whitelist Validation
+pub const TOKEN_WHITELIST_VALIDATED_TOPIC: Symbol = symbol_short!("tok_wl");
+// Issue #583: Token Staking
+pub const TOKEN_STAKING_TOPIC: Symbol = symbol_short!("tok_stk");
+pub const TOKEN_UNSTAKING_TOPIC: Symbol = symbol_short!("tok_unstk");
+// Issue #584: Yield Distribution
+pub const YIELD_DISTRIBUTED_TOPIC: Symbol = symbol_short!("yld_dist");
+pub const YIELD_REINVESTED_TOPIC: Symbol = symbol_short!("yld_rein");
+// Issue #585: Token Lending
+pub const TOKEN_LENDING_TOPIC: Symbol = symbol_short!("tok_lend");
+pub const TOKEN_LEND_REPAY_TOPIC: Symbol = symbol_short!("tok_lrep");
+// Issue #586: Token Collateral
+pub const TOKEN_COLLATERAL_TOPIC: Symbol = symbol_short!("tok_coll");
+pub const TOKEN_COLLAT_RLSD_TOPIC: Symbol = symbol_short!("tok_crls");
+// Issue #587: Token Hedging
+pub const TOKEN_HEDGE_TOPIC: Symbol = symbol_short!("tok_hedg");
+pub const TOKEN_HEDGE_CLOSE_TOPIC: Symbol = symbol_short!("tok_hcls");
+// Issue #588: Token Rebalancing
+pub const TOKEN_REBALANCE_TOPIC: Symbol = symbol_short!("tok_rebl");
+pub const TOKEN_REBALANCED_TOPIC: Symbol = symbol_short!("tok_rebd");
+
 // Vault state snapshots
 pub const SNAPSHOT_CREATED_TOPIC: Symbol = symbol_short!("snap_crt");
 pub const SNAPSHOT_RESTORED_TOPIC: Symbol = symbol_short!("snap_rst");
@@ -369,6 +392,20 @@ pub enum DataKey {
     VestingCatchUp(u64),
     // Issue #546: vesting bonus
     VestingBonus(u64),
+    // Issue #581: token conversion
+    TokenConversion(u64),
+    // Issue #583: token staking
+    TokenStaking(u64),
+    // Issue #584: yield distribution config
+    YieldDistributionConfig(u64),
+    // Issue #585: token lending
+    TokenLending(u64),
+    // Issue #586: token collateral
+    TokenCollateral(u64),
+    // Issue #587: token hedging
+    TokenHedge(u64),
+    // Issue #588: token rebalancing
+    TokenRebalance(u64),
 }
 
 /// Check-in history entry for TTL prediction - Issue #482
@@ -1123,4 +1160,122 @@ pub struct VestingBonusConfig {
     pub bonus_bps: u32,
     /// Seconds after an installment unlocks within which a claim is considered "on time".
     pub on_time_window_seconds: u64,
+}
+
+/// Token conversion configuration - Issue #581.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenConversion {
+    pub vault_id: u64,
+    pub from_token: Address,
+    pub to_token: Address,
+    /// Conversion rate in basis points (10000 = 1:1).
+    pub conversion_rate: i128,
+    pub enabled: bool,
+    pub created_at: u64,
+}
+
+/// Token staking configuration - Issue #583.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenStaking {
+    pub vault_id: u64,
+    pub staking_pool: Address,
+    pub staked_amount: i128,
+    pub staking_start: u64,
+    /// Annual yield in basis points (e.g., 500 = 5% APY).
+    pub annual_yield_bps: u32,
+    pub is_active: bool,
+}
+
+/// Yield distribution mode - Issue #584.
+#[contracttype]
+#[derive(Clone)]
+pub enum YieldDistributionMode {
+    /// Send all yield to the beneficiary.
+    DistributeToBeneficiary,
+    /// Reinvest all yield back into the vault balance.
+    Reinvest,
+    /// Send `beneficiary_bps` basis points to the beneficiary; reinvest the rest.
+    Split(u32),
+}
+
+/// Yield distribution config for a vault - Issue #584.
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDistributionConfig {
+    pub vault_id: u64,
+    pub mode: YieldDistributionMode,
+    pub last_distribution: u64,
+    pub total_distributed: i128,
+    pub total_reinvested: i128,
+}
+
+/// Token lending record - Issue #585.
+/// Tracks a loan of vault tokens lent out for interest income.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenLending {
+    pub vault_id: u64,
+    pub borrower: Address,
+    pub amount: i128,
+    /// Annual interest rate in basis points (e.g., 500 = 5%).
+    pub interest_rate_bps: u32,
+    pub lent_at: u64,
+    pub due_at: u64,
+    pub repaid: bool,
+    pub interest_earned: i128,
+}
+
+/// Token collateral configuration - Issue #586.
+/// Vault tokens used as collateral for a loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenCollateral {
+    pub vault_id: u64,
+    pub collateral_amount: i128,
+    pub loan_amount: i128,
+    /// Collateral ratio in basis points (e.g., 15000 = 150%).
+    pub collateral_ratio_bps: u32,
+    pub active: bool,
+    pub created_at: u64,
+}
+
+/// Token hedge configuration - Issue #587.
+/// Hedge vault token price risk using a derivative position.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenHedge {
+    pub vault_id: u64,
+    /// Token used for the hedge (e.g., a stablecoin).
+    pub hedge_token: Address,
+    pub notional_amount: i128,
+    /// Strike price in basis points relative to current price.
+    pub strike_price_bps: u32,
+    /// Unix timestamp when the hedge expires.
+    pub expiry: u64,
+    pub active: bool,
+    pub created_at: u64,
+}
+
+/// A single token weight entry for rebalancing - Issue #588.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenWeight {
+    pub token: Address,
+    /// Target allocation in basis points (all entries must sum to 10000).
+    pub target_bps: u32,
+}
+
+/// Token rebalancing configuration - Issue #588.
+/// Automatically rebalances a multi-token portfolio based on target weights.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenRebalanceConfig {
+    pub vault_id: u64,
+    pub target_weights: Vec<TokenWeight>,
+    pub last_rebalance: u64,
+    /// Drift threshold in basis points that triggers a rebalance (e.g., 500 = 5%).
+    pub rebalance_threshold_bps: u32,
+    pub total_rebalances: u32,
 }

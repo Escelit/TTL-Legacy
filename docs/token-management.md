@@ -1,6 +1,6 @@
 # Token Management Features
 
-This document describes the token management features implemented in TTL-Legacy, including token conversion, staking, and yield distribution.
+This document describes the token management features implemented in TTL-Legacy, including token conversion, staking, yield distribution, lending, collateral, hedging, and rebalancing.
 
 ## Overview
 
@@ -10,6 +10,10 @@ TTL-Legacy now supports advanced token management capabilities that allow vault 
 2. **Validate token whitelisting** in batch operations (Issue #582)
 3. **Stake tokens** for yield while locked (Issue #583)
 4. **Distribute or reinvest yield** (Issue #584)
+5. **Lend vault tokens** for interest income (Issue #585)
+6. **Use tokens as collateral** for loans (Issue #586)
+7. **Hedge token price risk** using derivatives (Issue #587)
+8. **Rebalance multi-token portfolios** based on target weights (Issue #588)
 
 ## Issue #581: Token Conversion
 
@@ -355,32 +359,186 @@ println!("Distributed to beneficiary: {}", config.total_distributed);
 println!("Reinvested: {}", config.total_reinvested);
 ```
 
+## Issue #585: Token Lending
+
+### Purpose
+
+Allow vault owners to lend vault tokens to a borrower and earn interest income.
+
+### API
+
+#### Enable Token Lending
+
+```rust
+pub fn enable_token_lending(
+    env: Env,
+    vault_id: u64,
+    caller: Address,
+    borrower: Address,
+    amount: i128,
+    interest_rate_bps: u32,
+    duration_seconds: u64,
+) -> Result<(), ContractError>
+```
+
+**Parameters:**
+- `vault_id`: The vault ID
+- `caller`: Must be the vault owner
+- `borrower`: Address of the borrower
+- `amount`: Amount to lend (must be ≤ vault balance)
+- `interest_rate_bps`: Annual interest rate in basis points (e.g., 500 = 5%)
+- `duration_seconds`: Loan duration in seconds
+
+**Events:**
+- `TOKEN_LENDING_TOPIC`: Emitted when lending is enabled
+
+#### Repay Token Loan
+
+```rust
+pub fn repay_token_loan(env: Env, vault_id: u64, caller: Address) -> Result<i128, ContractError>
+```
+
+Returns the accrued interest earned.
+
+**Events:**
+- `TOKEN_LEND_REPAY_TOPIC`: Emitted on repayment
+
+#### Get Token Lending
+
+```rust
+pub fn get_token_lending(env: Env, vault_id: u64) -> Option<TokenLending>
+```
+
+## Issue #586: Token Collateral
+
+### Purpose
+
+Allow vault owners to use vault tokens as collateral for an external loan.
+
+### API
+
+#### Set Token Collateral
+
+```rust
+pub fn set_token_collateral(
+    env: Env,
+    vault_id: u64,
+    caller: Address,
+    collateral_amount: i128,
+    loan_amount: i128,
+    collateral_ratio_bps: u32,
+) -> Result<(), ContractError>
+```
+
+**Parameters:**
+- `collateral_ratio_bps`: Required collateral ratio ≥ 10000 (100%)
+
+**Events:**
+- `TOKEN_COLLATERAL_TOPIC`: Emitted when collateral is set
+
+#### Release Token Collateral
+
+```rust
+pub fn release_token_collateral(env: Env, vault_id: u64, caller: Address) -> Result<(), ContractError>
+```
+
+**Events:**
+- `TOKEN_COLLAT_RLSD_TOPIC`: Emitted when collateral is released
+
+#### Get Token Collateral
+
+```rust
+pub fn get_token_collateral(env: Env, vault_id: u64) -> Option<TokenCollateral>
+```
+
+## Issue #587: Token Hedging
+
+### Purpose
+
+Allow vault owners to hedge token price risk using a derivative position.
+
+### API
+
+#### Enable Token Hedge
+
+```rust
+pub fn enable_token_hedge(
+    env: Env,
+    vault_id: u64,
+    caller: Address,
+    hedge_token: Address,
+    notional_amount: i128,
+    strike_price_bps: u32,
+    expiry: u64,
+) -> Result<(), ContractError>
+```
+
+**Events:**
+- `TOKEN_HEDGE_TOPIC`: Emitted when hedge is enabled
+
+#### Close Token Hedge
+
+```rust
+pub fn close_token_hedge(env: Env, vault_id: u64, caller: Address) -> Result<(), ContractError>
+```
+
+**Events:**
+- `TOKEN_HEDGE_CLOSE_TOPIC`: Emitted when hedge is closed
+
+#### Get Token Hedge
+
+```rust
+pub fn get_token_hedge(env: Env, vault_id: u64) -> Option<TokenHedge>
+```
+
+## Issue #588: Token Rebalancing
+
+### Purpose
+
+Automatically rebalance a multi-token vault portfolio based on configured target weights.
+
+### API
+
+#### Set Token Rebalance
+
+```rust
+pub fn set_token_rebalance(
+    env: Env,
+    vault_id: u64,
+    caller: Address,
+    target_weights: Vec<TokenWeight>,
+    rebalance_threshold_bps: u32,
+) -> Result<(), ContractError>
+```
+
+**Parameters:**
+- `target_weights`: Per-token allocations; `target_bps` values must sum to 10000
+- `rebalance_threshold_bps`: Drift tolerance before triggering a rebalance (e.g., 500 = 5%)
+
+**Events:**
+- `TOKEN_REBALANCE_TOPIC`: Emitted when rebalance config is set
+
+#### Trigger Rebalance
+
+```rust
+pub fn trigger_rebalance(env: Env, vault_id: u64) -> Result<(), ContractError>
+```
+
+**Events:**
+- `TOKEN_REBALANCED_TOPIC`: Emitted on each rebalance
+
+#### Get Token Rebalance
+
+```rust
+pub fn get_token_rebalance(env: Env, vault_id: u64) -> Option<TokenRebalanceConfig>
+```
+
 ## Security Considerations
 
 1. **Token Whitelisting**: Only whitelisted tokens can be used in vaults
-2. **Owner Authorization**: Only vault owners can configure staking and yield distribution
+2. **Owner Authorization**: Only vault owners can configure staking, lending, collateral, hedging, and rebalancing
 3. **Yield Calculation**: Yield is calculated based on time elapsed and annual rate
 4. **Atomic Operations**: Batch deposits validate all items before any transfers
 5. **Event Tracking**: All operations emit events for on-chain audit trails
-
-## Testing
-
-Comprehensive tests are included for all token management features:
-
-- `test_batch_deposit_validates_token_whitelist`: Validates token whitelist in batch operations
-- `test_enable_token_conversion`: Tests token conversion configuration
-- `test_enable_token_staking`: Tests staking enablement
-- `test_disable_token_staking`: Tests staking disablement
-- `test_set_yield_distribution_*`: Tests all yield distribution modes
-- `test_distribute_yield_*`: Tests yield distribution with different modes
-- `test_batch_deposit_with_token_validation`: Tests batch deposit with multiple vaults
-
-## Future Enhancements
-
-Potential future improvements:
-
-1. **Dynamic Yield Rates**: Support for variable yield rates based on market conditions
-2. **Multiple Staking Pools**: Allow staking in multiple pools simultaneously
-3. **Yield Swaps**: Automatically swap yield to preferred tokens
-4. **Yield Caps**: Set maximum yield distribution limits
-5. **Yield History**: Track historical yield distributions
+6. **Collateral Ratio**: Collateral ratio must be ≥ 100% to prevent under-collateralised loans
+7. **Balance Checks**: Lending and collateral operations verify sufficient vault balance

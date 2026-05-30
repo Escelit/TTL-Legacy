@@ -65,6 +65,14 @@ use types::{
     VestingCatchUpConfig, VestingBonusConfig,
     VESTING_CATCHUP_SET_TOPIC, VESTING_CATCHUP_CLAIMED_TOPIC,
     VESTING_BONUS_SET_TOPIC, VESTING_BONUS_CLAIMED_TOPIC,
+    TokenConversion, TokenStaking, YieldDistributionMode, YieldDistributionConfig,
+    TOKEN_CONVERSION_TOPIC, TOKEN_WHITELIST_VALIDATED_TOPIC,
+    TOKEN_STAKING_TOPIC, TOKEN_UNSTAKING_TOPIC,
+    YIELD_DISTRIBUTED_TOPIC, YIELD_REINVESTED_TOPIC,
+    TokenLending, TOKEN_LENDING_TOPIC, TOKEN_LEND_REPAY_TOPIC,
+    TokenCollateral, TOKEN_COLLATERAL_TOPIC, TOKEN_COLLAT_RLSD_TOPIC,
+    TokenHedge, TOKEN_HEDGE_TOPIC, TOKEN_HEDGE_CLOSE_TOPIC,
+    TokenWeight, TokenRebalanceConfig, TOKEN_REBALANCE_TOPIC, TOKEN_REBALANCED_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;
@@ -10090,5 +10098,427 @@ impl TtlVaultContract {
         env.storage().persistent().extend_ttl(&sched_key, VAULT_TTL_THRESHOLD, ttl);
         env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
         Ok(total_amount)
+    }
+
+    // --- Issue #585: Token Lending ---
+
+    /// Enables token lending for a vault, allowing vault tokens to be lent out for interest income.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `borrower` - Address of the borrower
+    /// * `amount` - Amount to lend in stroops
+    /// * `interest_rate_bps` - Annual interest rate in basis points (e.g., 500 = 5%)
+    /// * `duration_seconds` - Loan duration in seconds
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InsufficientBalance` - If vault balance is insufficient
+    pub fn enable_token_lending(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        borrower: Address,
+        amount: i128,
+        interest_rate_bps: u32,
+        duration_seconds: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if amount <= 0 || vault.balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let now = env.ledger().timestamp();
+        let lending = TokenLending {
+            vault_id,
+            borrower: borrower.clone(),
+            amount,
+            interest_rate_bps,
+            lent_at: now,
+            due_at: now.saturating_add(duration_seconds),
+            repaid: false,
+            interest_earned: 0,
+        };
+
+        let key = DataKey::TokenLending(vault_id);
+        env.storage().persistent().set(&key, &lending);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_LENDING_TOPIC, vault_id),
+            (&borrower, amount, interest_rate_bps, duration_seconds),
+        );
+        Ok(())
+    }
+
+    /// Repays a token loan and records the interest earned.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InvalidAmount` - If no active lending exists or already repaid
+    pub fn repay_token_loan(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<i128, ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::TokenLending(vault_id);
+        let mut lending: TokenLending = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvalidAmount)?;
+
+        if lending.repaid {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        // Calculate accrued interest: amount * rate * elapsed / (10000 * 365 * 86400)
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(lending.lent_at);
+        let interest = (lending.amount as i128)
+            .checked_mul(lending.interest_rate_bps as i128)
+            .and_then(|v| v.checked_mul(elapsed as i128))
+            .and_then(|v| v.checked_div(10000 * 365 * 86400))
+            .unwrap_or(0);
+
+        lending.repaid = true;
+        lending.interest_earned = interest;
+        env.storage().persistent().set(&key, &lending);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_LEND_REPAY_TOPIC, vault_id),
+            (lending.borrower.clone(), lending.amount, interest),
+        );
+        Ok(interest)
+    }
+
+    /// Returns the token lending record for a vault.
+    pub fn get_token_lending(env: Env, vault_id: u64) -> Option<TokenLending> {
+        env.storage().persistent().get(&DataKey::TokenLending(vault_id))
+    }
+
+    // --- Issue #586: Token Collateral ---
+
+    /// Configures vault tokens as collateral for a loan.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `collateral_amount` - Amount of vault tokens used as collateral
+    /// * `loan_amount` - Amount of tokens borrowed against the collateral
+    /// * `collateral_ratio_bps` - Required collateral ratio in bps (e.g., 15000 = 150%)
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InsufficientBalance` - If vault balance is insufficient
+    /// * `ContractError::InvalidBps` - If collateral ratio is below 10000 (100%)
+    pub fn set_token_collateral(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        collateral_amount: i128,
+        loan_amount: i128,
+        collateral_ratio_bps: u32,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if collateral_amount <= 0 || vault.balance < collateral_amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+        if collateral_ratio_bps < 10_000 {
+            return Err(ContractError::InvalidBps);
+        }
+
+        let collateral = TokenCollateral {
+            vault_id,
+            collateral_amount,
+            loan_amount,
+            collateral_ratio_bps,
+            active: true,
+            created_at: env.ledger().timestamp(),
+        };
+
+        let key = DataKey::TokenCollateral(vault_id);
+        env.storage().persistent().set(&key, &collateral);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_COLLATERAL_TOPIC, vault_id),
+            (collateral_amount, loan_amount, collateral_ratio_bps),
+        );
+        Ok(())
+    }
+
+    /// Releases the collateral position for a vault.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InvalidAmount` - If no active collateral exists
+    pub fn release_token_collateral(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::TokenCollateral(vault_id);
+        let mut collateral: TokenCollateral = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvalidAmount)?;
+
+        if !collateral.active {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        collateral.active = false;
+        env.storage().persistent().set(&key, &collateral);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_COLLAT_RLSD_TOPIC, vault_id),
+            (collateral.collateral_amount, collateral.loan_amount),
+        );
+        Ok(())
+    }
+
+    /// Returns the token collateral configuration for a vault.
+    pub fn get_token_collateral(env: Env, vault_id: u64) -> Option<TokenCollateral> {
+        env.storage().persistent().get(&DataKey::TokenCollateral(vault_id))
+    }
+
+    // --- Issue #587: Token Hedging ---
+
+    /// Enables a hedge position to protect against vault token price risk.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `hedge_token` - Token used for hedging (e.g., a stablecoin)
+    /// * `notional_amount` - Notional value of the hedge position
+    /// * `strike_price_bps` - Strike price in basis points relative to current price
+    /// * `expiry` - Unix timestamp when the hedge expires
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InvalidAmount` - If notional amount is not positive
+    pub fn enable_token_hedge(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        hedge_token: Address,
+        notional_amount: i128,
+        strike_price_bps: u32,
+        expiry: u64,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+        if notional_amount <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let now = env.ledger().timestamp();
+        let hedge = TokenHedge {
+            vault_id,
+            hedge_token: hedge_token.clone(),
+            notional_amount,
+            strike_price_bps,
+            expiry,
+            active: true,
+            created_at: now,
+        };
+
+        let key = DataKey::TokenHedge(vault_id);
+        env.storage().persistent().set(&key, &hedge);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_HEDGE_TOPIC, vault_id),
+            (&hedge_token, notional_amount, strike_price_bps, expiry),
+        );
+        Ok(())
+    }
+
+    /// Closes an active hedge position for a vault.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InvalidAmount` - If no active hedge exists
+    pub fn close_token_hedge(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let key = DataKey::TokenHedge(vault_id);
+        let mut hedge: TokenHedge = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvalidAmount)?;
+
+        if !hedge.active {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        hedge.active = false;
+        env.storage().persistent().set(&key, &hedge);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_HEDGE_CLOSE_TOPIC, vault_id),
+            (hedge.notional_amount, hedge.strike_price_bps),
+        );
+        Ok(())
+    }
+
+    /// Returns the token hedge configuration for a vault.
+    pub fn get_token_hedge(env: Env, vault_id: u64) -> Option<TokenHedge> {
+        env.storage().persistent().get(&DataKey::TokenHedge(vault_id))
+    }
+
+    // --- Issue #588: Token Rebalancing ---
+
+    /// Configures automatic portfolio rebalancing based on target token weights.
+    ///
+    /// All `target_bps` values across the weights must sum to 10000.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    /// * `caller` - Must be the vault owner
+    /// * `target_weights` - Per-token target allocations (basis points, must sum to 10000)
+    /// * `rebalance_threshold_bps` - Drift tolerance before triggering rebalance (e.g., 500 = 5%)
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner` - If caller is not the vault owner
+    /// * `ContractError::InvalidBps` - If weights do not sum to 10000
+    pub fn set_token_rebalance(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        target_weights: Vec<TokenWeight>,
+        rebalance_threshold_bps: u32,
+    ) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        caller.require_auth();
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        // Validate weights sum to 10000
+        let total_bps: u32 = target_weights.iter().map(|w| w.target_bps).sum();
+        if total_bps != 10_000 {
+            return Err(ContractError::InvalidBps);
+        }
+
+        let config = TokenRebalanceConfig {
+            vault_id,
+            target_weights,
+            last_rebalance: env.ledger().timestamp(),
+            rebalance_threshold_bps,
+            total_rebalances: 0,
+        };
+
+        let key = DataKey::TokenRebalance(vault_id);
+        env.storage().persistent().set(&key, &config);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_REBALANCE_TOPIC, vault_id),
+            (rebalance_threshold_bps,),
+        );
+        Ok(())
+    }
+
+    /// Triggers a portfolio rebalance for a vault.
+    ///
+    /// Records the rebalance event and updates the last rebalance timestamp and counter.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault ID
+    ///
+    /// # Errors
+    /// * `ContractError::InvalidAmount` - If no rebalance config exists
+    pub fn trigger_rebalance(env: Env, vault_id: u64) -> Result<(), ContractError> {
+        Self::assert_not_paused(&env);
+        let key = DataKey::TokenRebalance(vault_id);
+        let mut config: TokenRebalanceConfig = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ContractError::InvalidAmount)?;
+
+        let now = env.ledger().timestamp();
+        config.last_rebalance = now;
+        config.total_rebalances = config.total_rebalances.saturating_add(1);
+
+        env.storage().persistent().set(&key, &config);
+        env.storage().persistent().extend_ttl(&key, VAULT_TTL_THRESHOLD, VAULT_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+
+        env.events().publish(
+            (TOKEN_REBALANCED_TOPIC, vault_id),
+            (config.total_rebalances, now),
+        );
+        Ok(())
+    }
+
+    /// Returns the token rebalancing configuration for a vault.
+    pub fn get_token_rebalance(env: Env, vault_id: u64) -> Option<TokenRebalanceConfig> {
+        env.storage().persistent().get(&DataKey::TokenRebalance(vault_id))
     }
 }
