@@ -44,9 +44,9 @@ TTL-Legacy supports biometric verification (fingerprint, face) as an enhanced ch
 ### Biometric API
 
 ```rust
-register_biometric(vault_id: u64, caller: Address, credential_hash: BytesN<32>) -> Result<(), ContractError>
-remove_biometric(vault_id: u64, caller: Address, credential_hash: BytesN<32>) -> Result<(), ContractError>
-biometric_check_in(vault_id: u64, caller: Address, credential_hash: BytesN<32>) -> Result<(), ContractError>
+bind_passkey_biometric(vault_id: u64, caller: Address, passkey_hash: BytesN<32>, credential_hash: BytesN<32>) -> Result<(), ContractError>
+unbind_passkey_biometric(vault_id: u64, caller: Address, passkey_hash: BytesN<32>) -> Result<(), ContractError>
+biometric_check_in(vault_id: u64, caller: Address, passkey_hash: BytesN<32>, credential_hash: BytesN<32>) -> Result<(), ContractError>
 get_vault_biometrics(vault_id: u64) -> Vec<BiometricEntry>
 is_valid_biometric(vault_id: u64, credential_hash: BytesN<32>) -> bool
 ```

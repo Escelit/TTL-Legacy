@@ -79,6 +79,62 @@ fn regression_checkin_extends_ttl() {
     assert!(ttl_after > ttl_before, "TTL should be extended after check-in");
 }
 
+#[test]
+fn passkey_biometric_bind_and_checkin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let owner = Address::generate(&env);
+    let beneficiary = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract_v2(token_admin).address();
+
+    // Initialize contract
+    let contract_address = env.register_contract(None, TtlVaultContract);
+    let client = TtlVaultContractClient::new(&env, &contract_address);
+    client.initialize(&token_address, &admin);
+
+    // Create vault
+    let vault_id = client.create_vault(&owner, &beneficiary, &1000u64, &None);
+
+    // Prepare passkey and biometric hashes
+    let passkey_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+    let biometric_hash = BytesN::<32>::from_array(&env, &[2u8; 32]);
+
+    // Add passkey and bind biometric
+    client.add_passkey(&vault_id, &owner, &passkey_hash);
+    client.bind_passkey_biometric(&vault_id, &owner, &passkey_hash, &biometric_hash);
+
+    // Perform biometric check-in
+    client.biometric_check_in(&vault_id, &owner, &passkey_hash, &biometric_hash);
+
+    // Verify passkey record contains biometric binding
+    let passkeys = client.get_vault_passkeys(&vault_id);
+    assert!(passkeys.len() > 0);
+    let found = passkeys.iter().any(|p| p.hash == passkey_hash && p.biometric_hash.is_some());
+    assert!(found, "Biometric binding should be present on the passkey");
+
+    // Verify events were emitted
+    let events = env.events().all();
+    let mut saw_bind = false;
+    let mut saw_bio_ci = false;
+    for e in events.iter() {
+        let topics: soroban_sdk::Vec<Val> = e.1.clone().into_val(&env);
+        if let Ok(sym) = topics.get(0).and_then(|t| t.try_into_val(&env)) {
+            let s: soroban_sdk::Symbol = sym;
+            if s == BIND_PASSKEY_BIOMETRIC_TOPIC {
+                saw_bind = true;
+            }
+            if s == BIO_CHECKIN_TOPIC {
+                saw_bio_ci = true;
+            }
+        }
+    }
+    assert!(saw_bind, "bind event should be emitted");
+    assert!(saw_bio_ci, "biometric check-in event should be emitted");
+}
+
 /// Regression test: Ensure deposit increases vault balance
 /// Previously: Bug caused deposits to not update balance
 #[test]

@@ -57,6 +57,10 @@ pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
 pub const RECOVERY_EXTEND_TOPIC: Symbol = symbol_short!("rec_ext");
 pub const RESTORE_VAULT_TOPIC: Symbol = symbol_short!("restore");
 pub const PASSKEY_USAGE_TOPIC: Symbol = symbol_short!("pk_usage");
+// Biometric binding events
+pub const BIND_PASSKEY_BIOMETRIC_TOPIC: Symbol = symbol_short!("bind_pk_bio");
+pub const UNBIND_PASSKEY_BIOMETRIC_TOPIC: Symbol = symbol_short!("ubind_pk_bio");
+pub const BIO_CHECKIN_TOPIC: Symbol = symbol_short!("bio_ci");
 pub const VAULT_CLONED_TOPIC: Symbol = symbol_short!("v_clone");
 pub const VAULT_CLONED_OVERRIDE_TOPIC: Symbol = symbol_short!("v_clo_ov");
 pub const VAULT_MERGED_TOPIC: Symbol = symbol_short!("v_merge");
@@ -503,6 +507,8 @@ pub struct BridgeConfig {
 pub struct PasskeyHash {
     pub hash: BytesN<32>,
     pub added_at: u64,
+    /// Optional biometric credential hash bound to this passkey (SHA-256 commitment)
+    pub biometric_hash: Option<BytesN<32>>,
 }
 
 /// Backup code entry - Issue #393
