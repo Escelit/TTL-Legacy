@@ -114,6 +114,15 @@ pub const WITHDRAWAL_LIMIT_EXCEEDED_TOPIC: Symbol = symbol_short!("wd_exc");
 pub const WHITELIST_ADDED_TOPIC: Symbol = symbol_short!("wl_add");
 pub const WHITELIST_REMOVED_TOPIC: Symbol = symbol_short!("wl_rem");
 pub const WHITELIST_VIOLATION_TOPIC: Symbol = symbol_short!("wl_vio");
+pub const TOKEN_WHITELIST_VALIDATED_TOPIC: Symbol = symbol_short!("tok_wl");
+pub const TOKEN_CONVERSION_TOPIC: Symbol = symbol_short!("tok_conv");
+pub const TOKEN_STAKING_TOPIC: Symbol = symbol_short!("tok_stk");
+pub const TOKEN_UNSTAKING_TOPIC: Symbol = symbol_short!("tok_ust");
+pub const YIELD_DISTRIBUTED_TOPIC: Symbol = symbol_short!("yld_dst");
+pub const YIELD_REINVESTED_TOPIC: Symbol = symbol_short!("yld_rin");
+// Wrapped token registration for cross-chain compatibility
+pub const WRAPPED_TOKEN_REGISTERED_TOPIC: Symbol = symbol_short!("wrp_reg");
+pub const WRAPPED_TOKEN_UNREGISTERED_TOPIC: Symbol = symbol_short!("wrp_unr");
 // Issue #568: withdrawal reversal
 pub const WITHDRAWAL_REVERSED_TOPIC: Symbol = symbol_short!("wd_rev");
 pub const REVERSAL_GRACE_EXPIRED_TOPIC: Symbol = symbol_short!("rev_exp");
@@ -290,6 +299,7 @@ pub enum DataKey {
     MilestoneVestingSchedule(u64),
     CountdownFired(u64),
     TokenWhitelist(Address),
+    WrappedToken(Address),
     VaultMetadata(u64),
     ParentVault(u64),
     VaultPasskeys(u64),
@@ -303,6 +313,8 @@ pub enum DataKey {
     MaxTtlSeconds,
     TtlDecayRate,
     BridgeConfig(u32),
+    TokenConversion(u64),
+    TokenStaking(u64),
     PasskeyUsage(u64),
     BeneficiaryStatus(u64),
     PasskeyExpiry(u64, BytesN<32>),
@@ -511,6 +523,48 @@ pub struct BridgeConfig {
     pub chain_id: u32,
     pub bridge_address: Address,
     pub is_active: bool,
+}
+
+/// Token conversion configuration for a vault.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenConversion {
+    pub vault_id: u64,
+    pub from_token: Address,
+    pub to_token: Address,
+    pub conversion_rate: i128,
+    pub enabled: bool,
+    pub created_at: u64,
+}
+
+/// Token staking configuration for a vault.
+#[contracttype]
+#[derive(Clone)]
+pub struct TokenStaking {
+    pub vault_id: u64,
+    pub staking_pool: Address,
+    pub staked_amount: i128,
+    pub staking_start: u64,
+    pub annual_yield_bps: u32,
+    pub is_active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum YieldDistributionMode {
+    DistributeToBeneficiary,
+    Reinvest,
+    Split(u32),
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldDistributionConfig {
+    pub vault_id: u64,
+    pub mode: YieldDistributionMode,
+    pub last_distribution: u64,
+    pub total_distributed: i128,
+    pub total_reinvested: i128,
 }
 
 /// Passkey hash for multi-passkey support - Issue #394
