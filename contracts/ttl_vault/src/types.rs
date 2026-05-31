@@ -51,6 +51,8 @@ pub const PASSKEY_EXPIRY_EXTENDED_TOPIC: Symbol = symbol_short!("pk_exp");
 pub const BENEFICIARY_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_acc");
 pub const BENEFICIARY_DECLINED_TOPIC: Symbol = symbol_short!("ben_dec");
 pub const BENEFICIARY_CONDITION_ACCEPTED_TOPIC: Symbol = symbol_short!("ben_cond");
+pub const BENEFICIARY_IDENTITY_ORACLE_SET_TOPIC: Symbol = symbol_short!("ben_id_or");
+pub const BENEFICIARY_IDENTITY_VERIFIED_TOPIC: Symbol = symbol_short!("ben_id_vf");
 pub const BENEFICIARY_CONFLICT_FILED_TOPIC: Symbol = symbol_short!("ben_conf");
 pub const BENEFICIARY_CONFLICT_RESOLVED_TOPIC: Symbol = symbol_short!("ben_res");
 pub const SET_RECOVERY_TOPIC: Symbol = symbol_short!("set_rec");
@@ -366,6 +368,8 @@ pub enum DataKey {
     // Issue #499: beneficiary release votes
     ReleaseVotes(u64),
     ReleaseVoteThreshold(u64),
+    BeneficiaryIdentityOracle(u64),
+    BeneficiaryIdentityVerification(u64),
     BeneficiaryReleaseTriggers(u64),
     BeneficiaryTierThreshold(u64, Address),
     BeneficiaryStatusEntry(u64, Address),
@@ -819,6 +823,15 @@ pub struct ConditionalAcceptanceEntry {
 pub struct BeneficiaryConditionalAcceptance {
     pub min_balance_threshold: i128,
     pub accepted_at: u64,
+}
+
+/// Beneficiary identity verification entry.
+#[contracttype]
+#[derive(Clone)]
+pub struct BeneficiaryIdentityVerificationEntry {
+    pub beneficiary: Address,
+    pub verifier: Address,
+    pub verified_at: u64,
 }
 
 /// Beneficiary conflict claim - Issue #502
