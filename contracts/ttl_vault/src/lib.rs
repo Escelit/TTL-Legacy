@@ -73,9 +73,12 @@ use types::{
     TokenCollateral, TOKEN_COLLATERAL_TOPIC, TOKEN_COLLAT_RLSD_TOPIC,
     TokenHedge, TOKEN_HEDGE_TOPIC, TOKEN_HEDGE_CLOSE_TOPIC,
     TokenWeight, TokenRebalanceConfig, TOKEN_REBALANCE_TOPIC, TOKEN_REBALANCED_TOPIC,
+    BeneficiaryPool, POOL_CREATED_TOPIC,
 };
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod beneficiary_pooling_tests;
 
 /// Minimum TTL (in ledgers) before a persistent entry is eligible for extension.
 /// At ~5 s/ledger this is ~83 minutes.
@@ -10520,5 +10523,69 @@ impl TtlVaultContract {
     /// Returns the token rebalancing configuration for a vault.
     pub fn get_token_rebalance(env: Env, vault_id: u64) -> Option<TokenRebalanceConfig> {
         env.storage().persistent().get(&DataKey::TokenRebalance(vault_id))
+    }
+
+    /// Creates a beneficiary pool from registered vault beneficiaries - Issue #529.
+    ///
+    /// Validates that all `members` appear in the vault's beneficiary list, sums their
+    /// individual BPS allocations into `pooledAllocation[pool_id]`, and persists the pool.
+    ///
+    /// # Arguments
+    /// * `vault_id` - The vault whose beneficiary list is used for validation
+    /// * `caller`   - Must be the vault owner
+    /// * `pool_id`  - Unique pool identifier chosen by the caller
+    /// * `members`  - Addresses that must each be registered beneficiaries of the vault
+    ///
+    /// # Errors
+    /// * `ContractError::NotOwner`         - caller is not the vault owner
+    /// * `ContractError::InvalidBeneficiary` - a member is not in the vault's beneficiary list
+    pub fn create_pool(
+        env: Env,
+        vault_id: u64,
+        caller: Address,
+        pool_id: u64,
+        members: Vec<Address>,
+    ) -> Result<(), ContractError> {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+        let vault = Self::load_vault(&env, vault_id);
+        if caller != vault.owner {
+            return Err(ContractError::NotOwner);
+        }
+
+        let mut total_bps: u32 = 0;
+        for member in members.iter() {
+            let mut found = false;
+            for entry in vault.beneficiaries.iter() {
+                if entry.address == member {
+                    total_bps = total_bps.saturating_add(entry.bps);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(ContractError::InvalidBeneficiary);
+            }
+        }
+
+        let pool = BeneficiaryPool {
+            pool_id,
+            members: members.clone(),
+            total_bps,
+        };
+        env.storage().persistent().set(&DataKey::BeneficiaryPool(pool_id), &pool);
+        env.storage().persistent().extend_ttl(
+            &DataKey::BeneficiaryPool(pool_id),
+            VAULT_TTL_THRESHOLD,
+            VAULT_TTL_LEDGERS,
+        );
+        env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_LEDGERS);
+        env.events().publish((POOL_CREATED_TOPIC, pool_id), (members, total_bps));
+        Ok(())
+    }
+
+    /// Returns the pool record for `pool_id`, if it exists.
+    pub fn get_pool(env: Env, pool_id: u64) -> Option<BeneficiaryPool> {
+        env.storage().persistent().get(&DataKey::BeneficiaryPool(pool_id))
     }
 }
